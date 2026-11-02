@@ -3,8 +3,6 @@
 Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](context/constitution/roadmap.md).
 
 ## Ahora
-- [ ] `git init` y enlazar con el repositorio remoto de GitHub (necesito la URL)
-- [ ] Primer commit con la estructura y la constitución
 
 ## Siguiente (Fase 1 — Datos)
 - [ ] Escribir el script de descarga reproducible en `src/amp_gan/`
@@ -19,6 +17,7 @@ Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](
 - [ ] Licencia del repositorio
 
 ## Hecho
+- [x] Repositorio git inicializado, primer commit y publicado en GitHub (privado): `jacobo-nu/amp_gan`, rama `main`
 - [x] Notebook 01 y módulo de propiedades fisicoquímicas, validados por el orquestador (49 tests)
 - [x] Datos limpios 5–60 aa generados y validados por el orquestador (`make_clean_data.py`, 34 tests)
 - [x] Decisiones del usuario: rango de longitud 5–60 aa en ambas bases; GAN con Keras

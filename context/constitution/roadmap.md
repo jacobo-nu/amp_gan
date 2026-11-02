@@ -5,7 +5,7 @@ Estado: `[ ]` pendiente · `[~]` en curso · `[x]` hecho
 ## Fase 0 — Fundamentos
 - [x] Esquema de arquitectura (`unicode_scheme.md`)
 - [~] Estructura de repositorio y constitución
-- [ ] Repositorio git inicializado y enlazado a GitHub
+- [x] Repositorio git inicializado y enlazado a GitHub (privado, `jacobo-nu/amp_gan`)
 
 ## Fase 1 — Datos
 - [x] Fuente de datos: DRAMP (`general_amps.fasta`, `Antibacterial_amps.fasta`), citada en `context/data/README.md`
