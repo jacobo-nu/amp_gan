@@ -18,7 +18,7 @@ Estado: `[ ]` pendiente · `[~]` en curso · `[x]` hecho
 - [x] Notebook 01: exploración de datos (`src/notebooks/01_exploracion_datos.ipynb`; propiedades en `src/amp_gan/properties.py`, 49 tests)
 
 ## Fase 2 — Modelo base
-- [ ] Codificación de secuencias (one-hot / embeddings) y padding
+- [x] Codificación de secuencias: one-hot de 21 canales (20 aa + PAD), longitud fija 60 (`src/amp_gan/encoding.py`, 77 tests). Embeddings quedan como posible variante en la Fase 3
 - [ ] GAN base en Keras
 - [ ] Notebook 02: entrenamiento de la GAN base
 
