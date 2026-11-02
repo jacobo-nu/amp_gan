@@ -14,7 +14,11 @@
 6. Se respetan las licencias de las bases de datos y se citan las fuentes.
 
 ## Git
-- Rama `main` protegida; el trabajo se hace en ramas `feat/...` y `fix/...`.
+- `main` contiene siempre algo que funciona (tests y notebooks se ejecutan).
+- Cambios de documentación (`context/`, README, TODO): commit directo en `main`.
+- Código y experimentos (`src/`, variantes de GAN, notebooks): en ramas `feat/...` y `fix/...`, que se
+  unen a `main` solo cuando el orquestador las ha validado y el usuario las aprueba.
+- Los commits que genere el orquestador no se suben solos: el push lo hace el usuario.
 - Commits pequeños y descriptivos (convención `tipo: mensaje`).
 - **Push, PR y cualquier acción en GitHub requieren aprobación explícita del usuario.**
 
