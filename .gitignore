@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Material de contexto (datos y PDF): nunca se sincroniza con el repositorio.
+# Solo se versionan los README (índices y citas) y los .gitkeep.
+context/data/**
+!context/data/
+!context/data/README.md
+!context/data/*/
+!context/data/**/.gitkeep
+context/references/*
+!context/references/README.md
+!context/references/.gitkeep
+
+# Modelos y salidas pesadas
+*.pt
+*.pth
+*.ckpt
+runs/
+
+# Entorno / editor
+.env
+.vscode/
+.DS_Store
+
+# Bases de datos DRAMP (no se redistribuyen; ver context/data/README.md)
+*.fasta
+*.fa
