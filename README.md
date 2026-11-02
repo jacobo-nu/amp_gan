@@ -3,7 +3,7 @@
 Generación de péptidos antimicrobianos (AMP) con redes generativas adversarias (GAN),
 desarrollada con una arquitectura de agentes (orquestador + ejecutor).
 
-Proyecto académico de Biofísica (USC). Uso exclusivamente educativo y de investigación abierta.
+Proyecto académico de asignatura de Biofísica del grado de Física de la USC. Uso exclusivamente educativo y de investigación abierta.
 
 ## Estructura
 
