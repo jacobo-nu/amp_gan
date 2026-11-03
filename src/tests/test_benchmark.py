@@ -85,3 +85,50 @@ def test_fastest_by_batch_one_entry_per_batch_size():
     )
     res = {d["batch_size"]: (d["backend"], d["device"]) for d in fastest_by_batch(df)}
     assert res == {64: ("torch", "gpu"), 128: ("tensorflow", "cpu")}
+
+
+# --- collect_benchmark / run_benchmark (sin lanzar subprocesos reales) -------------
+def _fake_run_candidate(calls):
+    def fake(backend, device, batch_sizes, steps, warmup, fasta):
+        calls.append((backend, device, tuple(batch_sizes), steps, warmup))
+        return [
+            {"backend": backend, "device": device, "batch_size": bs, "status": "ok",
+             "n_steps": steps, "n_warmup": warmup, "est_epoch_s": 1.0 + bs / 100,
+             "n_samples": 100, "seed": 42}
+            for bs in batch_sizes
+        ]  # fmt: skip
+
+    return fake
+
+
+def test_collect_benchmark_returns_dataframe_without_writing(monkeypatch, tmp_path):
+    from amp_gan import benchmark
+
+    calls = []
+    monkeypatch.setattr(benchmark, "_run_candidate", _fake_run_candidate(calls))
+    monkeypatch.setattr(benchmark, "DEFAULT_CSV", tmp_path / "must_not_exist.csv")
+    cands = (("tensorflow", "cpu"), ("torch", "gpu"))
+    df = benchmark.collect_benchmark(candidates=cands, batch_sizes=(64, 128), steps=5, warmup=2)
+    assert list(df.columns) == benchmark.CSV_COLUMNS
+    assert len(df) == 4
+    assert calls == [
+        ("tensorflow", "cpu", (64, 128), 5, 2),
+        ("torch", "gpu", (64, 128), 5, 2),
+    ]
+    assert df["n_steps"].dtype == "Int64" and (df["n_steps"] == 5).all()
+    assert not list(tmp_path.iterdir())
+    # La regla de decisión funciona sobre este DataFrame.
+    assert select_fastest(df, 128)["backend"] == "tensorflow"
+
+
+def test_run_benchmark_still_writes_csv(monkeypatch, tmp_path):
+    from amp_gan import benchmark
+
+    monkeypatch.setattr(benchmark, "_run_candidate", _fake_run_candidate([]))
+    out = tmp_path / "sub" / "b.csv"
+    df = benchmark.run_benchmark(
+        candidates=(("torch", "cpu"),), batch_sizes=(128,), steps=3, warmup=1, csv_path=out
+    )
+    saved = pd.read_csv(out)
+    assert list(saved.columns) == benchmark.CSV_COLUMNS
+    assert len(saved) == len(df) == 1

@@ -13,6 +13,9 @@ Uso (desde la raíz del proyecto)::
     PYTHONPATH=src python -m amp_gan.benchmark
     PYTHONPATH=src python -m amp_gan.benchmark --steps 50 --batch-sizes 128
 
+Desde Python, :func:`collect_benchmark` hace la misma medición y devuelve el
+DataFrame en memoria (sin escribir el CSV; admite menos pasos medidos).
+
 Regla de decisión (:func:`select_fastest`): menor ``est_epoch_s`` al tamaño de
 lote de entrenamiento (128). Si la diferencia entre las dos primeras es menor
 del 10 % se consideran empatadas y se prefiere la más simple/estable (orden de
@@ -171,6 +174,15 @@ def _weights_device(model) -> str:
     """Dispositivo de los pesos (específico del backend; solo se usa en el benchmark)."""
     kinds = {_device_kind(str(getattr(w.value, "device", "cpu"))) for w in model.weights}
     return kinds.pop() if len(kinds) == 1 else "mixed"
+
+
+def weights_device(model) -> str:
+    """Dispositivo (``"cpu"``, ``"gpu"`` o ``"mixed"``) de los pesos de un modelo Keras.
+
+    Se apoya en el atributo ``device`` de los tensores del backend, así que es
+    específico de backend y solo debe usarse para diagnóstico (no en ``gan.py``).
+    """
+    return _weights_device(model)
 
 
 def _gpu_mem_mib() -> float | None:
@@ -332,6 +344,42 @@ def _run_candidate(backend, device, batch_sizes, steps, warmup, fasta) -> list[d
     return out
 
 
+def collect_benchmark(
+    candidates=CANDIDATES,
+    batch_sizes=BATCH_SIZES,
+    steps: int = DEFAULT_STEPS,
+    warmup: int = DEFAULT_WARMUP,
+    fasta: Path = DEFAULT_FASTA,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """Ejecuta todas las configuraciones y devuelve el DataFrame EN MEMORIA.
+
+    No escribe nada en disco. Tiene el mismo formato (columnas :data:`CSV_COLUMNS`)
+    que el CSV de :func:`run_benchmark`. Para una prueba rápida (por ejemplo desde
+    un notebook) se puede reducir ``steps`` (pasos medidos) y ``warmup``.
+
+    Args:
+        candidates: configuraciones ``(backend, dispositivo)``.
+        batch_sizes: tamaños de lote a medir.
+        steps: nº de pasos medidos por configuración y lote.
+        warmup: pasos de calentamiento (no medidos).
+        fasta: FASTA limpio con los datos de la medición.
+        verbose: si es ``True`` imprime el progreso.
+    """
+    rows = []
+    for backend, device in candidates:
+        if verbose:
+            print(f"[benchmark] {backend}/{device} ...", flush=True)
+        t0 = time.perf_counter()
+        rows.extend(_run_candidate(backend, device, batch_sizes, steps, warmup, fasta))
+        if verbose:
+            print(f"[benchmark]   hecho en {time.perf_counter() - t0:.0f} s", flush=True)
+    df = pd.DataFrame(rows).reindex(columns=CSV_COLUMNS)
+    for col in ("n_steps", "n_warmup", "n_samples"):
+        df[col] = df[col].astype("Int64")
+    return df
+
+
 def run_benchmark(
     candidates=CANDIDATES,
     batch_sizes=BATCH_SIZES,
@@ -341,15 +389,7 @@ def run_benchmark(
     csv_path: Path = DEFAULT_CSV,
 ) -> pd.DataFrame:
     """Ejecuta todas las configuraciones, escribe el CSV y devuelve el DataFrame."""
-    rows = []
-    for backend, device in candidates:
-        print(f"[benchmark] {backend}/{device} ...", flush=True)
-        t0 = time.perf_counter()
-        rows.extend(_run_candidate(backend, device, batch_sizes, steps, warmup, fasta))
-        print(f"[benchmark]   hecho en {time.perf_counter() - t0:.0f} s", flush=True)
-    df = pd.DataFrame(rows).reindex(columns=CSV_COLUMNS)
-    for col in ("n_steps", "n_warmup", "n_samples"):
-        df[col] = df[col].astype("Int64")
+    df = collect_benchmark(candidates, batch_sizes, steps, warmup, fasta, verbose=True)
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(csv_path, index=False)
