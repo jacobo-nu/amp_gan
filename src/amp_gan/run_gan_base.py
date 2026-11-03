@@ -1,14 +1,20 @@
-"""Entrena la GAN base con Antibacterial_amps y guarda los resultados.
+"""Entrena la GAN base (vanilla pura o estabilizada) con Antibacterial_amps y guarda los resultados.
 
 Uso (desde la raíz del proyecto)::
 
-    python src/amp_gan/run_gan_base.py
+    python src/amp_gan/run_gan_base.py                          # vanilla pura (gan_base_*)
+    python src/amp_gan/run_gan_base.py --variant stabilized     # estabilizada (gan_stab_*)
     python src/amp_gan/run_gan_base.py --epochs 10 --out-dir carpeta_de_prueba
+
+``--variant base`` (por defecto) usa ``GANConfig()``, la línea base y prefijo
+``gan_base``; ``--variant stabilized`` usa ``GANConfig.stabilized()`` (suavizado
+de etiquetas, ruido de instancia y Gumbel-softmax straight-through) y prefijo
+``gan_stab``. El protocolo es idéntico en ambas. Más abajo, ``gan_base_*`` se
+refiere al prefijo de la variante elegida.
 
 Pasos: aplica ``runtime.apply_fastest`` (backend y dispositivo más rápidos según
 ``benchmark_results.csv``, lote 128) ANTES de importar Keras; entrena con la
-configuración por defecto ``GANConfig()`` (sin ajustar hiperparámetros, es la
-línea base) durante 200 épocas con instantáneas cada 20 y 2000 secuencias por
+configuración de la variante (sin ajustar hiperparámetros) durante 200 épocas con instantáneas cada 20 y 2000 secuencias por
 evaluación; escribe en ``context/data/processed/`` (formato estable, usado por
 la comparación de la Fase 3):
 
@@ -60,11 +66,12 @@ EPOCHS = 200
 SNAPSHOT_EVERY = 20
 N_EVAL = 2000
 SEED = 42
-PREFIX = "gan_base"
+VARIANTS = {"base": "gan_base", "stabilized": "gan_stab"}
 
 
 def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--variant", choices=sorted(VARIANTS), default="base")
     p.add_argument("--epochs", type=int, default=EPOCHS)
     p.add_argument("--snapshot-every", type=int, default=SNAPSHOT_EVERY)
     p.add_argument("--n-eval", type=int, default=N_EVAL)
@@ -75,10 +82,11 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
+    prefix = VARIANTS[args.variant]
 
     # 1) Backend y dispositivo ANTES de importar keras.
     choice = runtime.apply_fastest(BENCHMARK_CSV, batch_size=128)
-    print(f"[run_gan_base] decisión del benchmark: {choice['message']}", flush=True)
+    print(f"[run_gan_base:{args.variant}] decisión del benchmark: {choice['message']}", flush=True)
 
     # 2) Ahora sí: keras y los módulos que lo importan.
     import numpy as np
@@ -93,20 +101,20 @@ def main(argv: list[str] | None = None) -> int:
     from amp_gan.gan import GANConfig
 
     env = runtime.describe_environment()
-    print(f"[run_gan_base] backend={env['keras_backend']} dispositivos={env['keras_devices']}", flush=True)
+    print(f"[run_gan_base:{args.variant}] backend={env['keras_backend']} dispositivos={env['keras_devices']}", flush=True)
     if env["keras_backend"] != choice["backend"]:
         raise RuntimeError(f"Backend pedido {choice['backend']}, usado {env['keras_backend']}.")
 
     X, df = load_encoded(TRAIN_FASTA)
-    print(f"[run_gan_base] datos: {X.shape} ({len(df):,} secuencias)", flush=True)
+    print(f"[run_gan_base:{args.variant}] datos: {X.shape} ({len(df):,} secuencias)", flush=True)
 
-    config = GANConfig(seed=args.seed)
+    config = GANConfig(seed=args.seed) if args.variant == "base" else GANConfig.stabilized(seed=args.seed)
     res = run_gan_experiment(
         X, df, config, epochs=args.epochs, snapshot_every=args.snapshot_every,
         n_eval=args.n_eval, eval_seed=args.seed,
     )  # fmt: skip
     device_used = weights_device(res.history.generator)
-    print(f"[run_gan_base] pesos del generador en: {device_used}", flush=True)
+    print(f"[run_gan_base:{args.variant}] pesos del generador en: {device_used}", flush=True)
 
     # 3) Salidas.
     out = Path(args.out_dir)
@@ -116,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         {"epoch": np.arange(1, args.epochs + 1)}
         | {k: res.history[k] for k in ("d_loss_real", "d_loss_fake", "d_loss", "g_loss")}
     )
-    hist.to_csv(out / f"{PREFIX}_history.csv", index=False, float_format="%.8g")
+    hist.to_csv(out / f"{prefix}_history.csv", index=False, float_format="%.8g")
 
     floors = reference_floors(df, n=args.n_eval, seed=args.seed)
     floor_rows = pd.DataFrame(
@@ -124,13 +132,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     metrics = pd.concat([res.metrics, floor_rows], ignore_index=True)
     metrics["epoch"] = metrics["epoch"].astype("Int64")
-    metrics.to_csv(out / f"{PREFIX}_metrics.csv", index=False, float_format="%.8g")
+    metrics.to_csv(out / f"{prefix}_metrics.csv", index=False, float_format="%.8g")
 
     for mode in MODES:
         seqs = res.sequences[mode]
         write_fasta(
             pd.DataFrame({"id": [f"gen_{i:04d}" for i in range(len(seqs))], "sequence": seqs}),
-            out / f"{PREFIX}_generated_{mode}.fasta",
+            out / f"{prefix}_generated_{mode}.fasta",
         )
 
     info = {
@@ -150,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         "benchmark_decision": {
             k: (list(v) if isinstance(v, tuple) else v) for k, v in choice.items()
         },
+        "variant": args.variant,
         "config": asdict(config),
         "epochs": args.epochs,
         "snapshot_every": args.snapshot_every,
@@ -161,15 +170,15 @@ def main(argv: list[str] | None = None) -> int:
         "timing_s": res.timing,
         "final_epoch_losses": {k: res.history[k][-1] for k in ("d_loss_real", "d_loss_fake", "g_loss")},
     }
-    (out / f"{PREFIX}_run_info.json").write_text(
+    (out / f"{prefix}_run_info.json").write_text(
         json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
     t = res.timing
-    print(f"[run_gan_base] tiempo total {t['total_s']:.1f} s (entrenamiento {t['train_s']:.1f} s, "
+    print(f"[run_gan_base:{args.variant}] tiempo total {t['total_s']:.1f} s (entrenamiento {t['train_s']:.1f} s, "
           f"evaluación {t['eval_s']:.1f} s); por época: media {t['mean_epoch_s']:.2f} s, "
           f"mediana {t['median_epoch_s']:.2f} s", flush=True)  # fmt: skip
-    print(f"[run_gan_base] archivos escritos en {out}", flush=True)
+    print(f"[run_gan_base:{args.variant}] archivos escritos en {out}", flush=True)
     return 0
 
 
