@@ -4,7 +4,8 @@ Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](
 
 ## Ahora
 - [x] Fase 3, WGAN-GP: hecha en `feat/wgan-gp` (4 de 5 condiciones frente a la referencia; ver roadmap). Pendiente de fusionar con `main`
-- [ ] Fase 3, GAN condicional con condición numérica (longitud → hidrofobicidad → ambas, percentiles 10–90)
+- [x] Fase 3, GAN condicional por longitud: hecha en `feat/conditional-gan` (criterios A y B cumplidos; ver roadmap). Pendiente de fusionar con `main`
+- [ ] Fase 3, GAN condicional por hidrofobicidad y después por ambas (percentiles 10–90)
 - [ ] Notebook 03: añadir las secciones de la GAN condicional y la comparación final de variantes
 
 ## Siguiente (Fase 1 — Datos)
