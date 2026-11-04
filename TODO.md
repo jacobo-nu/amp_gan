@@ -3,7 +3,6 @@
 Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](context/constitution/roadmap.md).
 
 ## Ahora
-- [ ] Selector de backend (ver «Entrega del trabajo»): CPU por defecto y celda opcional de prueba de rendimiento; se hace antes de la Fase 3, en `feat/backend-adaptativo`
 - [ ] Fijar versiones en `requirements.txt` tras verificarlo en un entorno limpio
 - [ ] Fase 3: WGAN-GP y condicional numérica (longitud → hidrofobicidad → ambas, percentiles 10–90)
 
@@ -11,12 +10,10 @@ Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](
 - [ ] Escribir el script de descarga reproducible en `src/amp_gan/`
 
 ## Entrega del trabajo
-- [ ] **Selección de backend según la máquina de quien ejecute el código.** El trabajo se entregará a un evaluador que probablemente no tendrá GPU. **Decisión del usuario (4-nov-2026):** la opción por defecto es **CPU**; antes de entrenar hay una celda *opcional* que evalúa qué backend/dispositivo es más rápido y, si el usuario la ejecuta, se usa ese en lugar de la CPU (indicado en el notebook como opcional, para quien no tenga gráfica). Estado actual: el notebook 02 ejecuta siempre la prueba en memoria, y `run_gan_base.py` exige `benchmark_results.csv` (generado a mano con `python src/amp_gan/benchmark.py`, no versionado, inexistente en un clon limpio). Hay que:
-  - cambiar el valor por defecto a CPU en notebooks y scripts, sin depender del CSV; la prueba de rendimiento pasa a ser una celda opcional (y una opción explícita en los scripts, p. ej. `--auto-backend`) cuyo resultado se aplica solo si se ejecuta;
-  - esa prueba debe detectar qué backends están instalados y qué dispositivos hay (con y sin GPU) y probar solo los disponibles, sin fallar si falta torch, TensorFlow o la GPU;
-  - no fiarse de un `benchmark_results.csv` generado en otra máquina (regenerar o ignorar si no coincide el hardware);
-  - `requirements.txt` ya incluye `torch`, `scipy` y `tensorflow` y no `biopython` (hecho 4-nov-2026); falta documentar que sin GPU el entrenamiento completo es más lento (~3 s/época por CPU frente a ~1,9 s en GPU);
-  - revisar que los notebooks se ejecuten de principio a fin en un entorno solo con CPU (con el valor por defecto).
+- [x] **Selección de backend según la máquina de quien ejecute el código** (hecho 4-nov-2026, `feat/backend-adaptativo`). CPU por defecto (`runtime.apply_cpu_default`: TensorFlow si está instalado, si no torch; `AMP_GAN_BACKEND` lo fuerza); opcionalmente `runtime.apply_auto_backend` / `--auto-backend` / interruptor `EVALUAR_BACKEND` del notebook 02 miden los candidatos disponibles y aplican el más rápido; sin GPU utilizable no mide y usa la CPU. Ningún script lee ya `benchmark_results.csv`. Comprobado: 184 tests (también con la GPU oculta y sin el CSV) y el notebook 02 completo en CPU sin errores.
+  - Tiempo en CPU medido en esta máquina: 3,9–4,4 s/época por modelo y **57 min** el notebook 02 completo (tres modelos); con GPU y la celda opcional, ~23 min. Pendiente: documentarlo en el README.
+  - Pendiente: las WGAN-GP necesitará una penalización de gradiente por backend (TensorFlow en CPU por defecto, torch en GPU).
+  - Los `*_run_info.json` ya generados conservan la clave antigua `benchmark_decision`; los nuevos usan `backend_mode` y `backend_decision`.
 
 ## Pendiente de decidir
 - [ ] Documentar cómo ejecutar notebooks y tests (el cwd debe estar dentro del proyecto); `pytest`, `jupyterlab`, `nbclient` e `ipykernel` ya están en `requirements.txt`

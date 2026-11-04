@@ -22,6 +22,7 @@ Estado: `[ ]` pendiente · `[~]` en curso · `[x]` hecho
 - [x] GAN base en Keras (vanilla, MLP, z=100; `src/amp_gan/gan.py`). Resultado: colapsa a pocas secuencias (línea base «vanilla pura»)
 - [x] Prueba de rendimiento de backends y dispositivos (`src/amp_gan/benchmark.py`): gana torch en GPU
 - [x] Notebook 02: entrenamiento y evaluación de la GAN base, con la prueba de rendimiento
+- [x] Selector de backend adaptativo: CPU por defecto y prueba de rendimiento opcional que elige el backend/dispositivo más rápido disponible (`src/amp_gan/runtime.py`, 184 tests)
 - [x] GAN vanilla estabilizada (etiqueta suavizada 0,9, ruido de instancia 0,1 con decaimiento, Gumbel-softmax straight-through) en el notebook 02. Ya no colapsa (2000 secuencias distintas), pero cumple solo 4 de los 5 criterios fijados de antemano: sesga la longitud (media 37,6 aa frente a 21,1; W1 de longitud 16,6 frente a 9,1 de la pura)
 - [x] Ablación con ruido de instancia constante (sección h del notebook 02, `--variant stabilized_const`): W1 de longitud 3,85 y longitud media 19,0 aa, sin deriva (criterio fijado de antemano cumplido: ≤ 8,3 y cociente época 200/100 ≤ 1,25). Respalda que el decaimiento del ruido causaba la deriva; una sola ejecución, semilla 42. **Será la referencia de la Fase 3** (GAN vanilla estabilizada con ruido constante)
 
