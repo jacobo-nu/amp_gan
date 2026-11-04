@@ -1,11 +1,13 @@
-"""Entrena la GAN base (vanilla pura o estabilizada) con Antibacterial_amps y guarda los resultados.
+"""Entrena la GAN base (vanilla pura, estabilizada o WGAN-GP) con Antibacterial_amps y guarda los resultados.
 
 Uso (desde la raíz del proyecto)::
 
     python src/amp_gan/run_gan_base.py                          # vanilla pura (gan_base_*)
     python src/amp_gan/run_gan_base.py --variant stabilized     # estabilizada (gan_stab_*)
     python src/amp_gan/run_gan_base.py --variant stabilized_const  # ablación: ruido constante (gan_stabc_*)
+    python src/amp_gan/run_gan_base.py --variant wgan_gp        # WGAN-GP (wgan_gp_*)
     python src/amp_gan/run_gan_base.py --epochs 10 --out-dir carpeta_de_prueba
+    python src/amp_gan/run_gan_base.py --epochs 3 --max-steps 20 --out-dir carpeta_de_prueba  # prueba rápida
     python src/amp_gan/run_gan_base.py --auto-backend           # mide y usa el backend/dispositivo más rápido
     python src/amp_gan/run_gan_base.py --backend torch          # fuerza el backend (también AMP_GAN_BACKEND=torch)
 
@@ -14,9 +16,14 @@ Uso (desde la raíz del proyecto)::
 de etiquetas, ruido de instancia y Gumbel-softmax straight-through) y prefijo
 ``gan_stab``; ``--variant stabilized_const`` usa
 ``GANConfig.stabilized_constant_noise()`` (igual que la estabilizada pero con el
-ruido de instancia constante en 0,1, sin decaer) y prefijo ``gan_stabc``. El
-protocolo es idéntico en todas. Más abajo, ``gan_base_*`` se
-refiere al prefijo de la variante elegida.
+ruido de instancia constante en 0,1, sin decaer) y prefijo ``gan_stabc``;
+``--variant wgan_gp`` usa ``WGANConfig()`` (WGAN-GP canónica, ver
+:mod:`amp_gan.wgan_gp`) y prefijo ``wgan_gp``. El protocolo (200 épocas,
+instantáneas, ``n_eval``, semilla y métricas) es idéntico en todas; en la WGAN-GP
+una época son ``n // batch_size`` pasos de crítico y el generador se actualiza una
+vez cada 5 de ellos. Más abajo, ``gan_base_*`` se refiere al prefijo de la
+variante elegida. ``--max-steps`` limita los pasos por época (solo para pruebas
+rápidas; no se usa en las ejecuciones de referencia).
 
 Pasos: elige el backend y el dispositivo ANTES de importar Keras. Por defecto usa
 la **CPU** (``runtime.apply_cpu_default``: TensorFlow si está instalado, si no
@@ -33,6 +40,12 @@ la comparación de la Fase 3):
 ``gan_base_history.csv``
     una fila por época. Columnas: ``epoch`` (desde 1), ``d_loss_real``,
     ``d_loss_fake``, ``d_loss`` (media de las dos) y ``g_loss`` (medias por época).
+    En la **WGAN-GP** las columnas son ``epoch``, ``critic_loss`` (pérdida del
+    crítico con penalización), ``wasserstein_estimate`` (= -(pérdida del crítico
+    sin penalización)), ``gradient_penalty`` (sin multiplicar por lambda),
+    ``g_loss`` (media de ``-mean(D(G(z)))`` en las actualizaciones del generador de
+    la época), ``critic_steps`` y ``generator_steps`` (pasos de crítico y
+    actualizaciones del generador de la época).
 ``gan_base_metrics.csv``
     una fila por (``epoch``, ``mode``) con ``mode`` en {``argmax``, ``sample``}
     para cada instantánea (épocas 1, 20, 40, ..., 200), más dos filas de suelo
@@ -78,12 +91,21 @@ EPOCHS = 200
 SNAPSHOT_EVERY = 20
 N_EVAL = 2000
 SEED = 42
-VARIANTS = {"base": "gan_base", "stabilized": "gan_stab", "stabilized_const": "gan_stabc"}
+VARIANTS = {"base": "gan_base", "stabilized": "gan_stab", "stabilized_const": "gan_stabc", "wgan_gp": "wgan_gp"}
+#: Columnas del historial por variante (las de la WGAN-GP son propias; ver el docstring del módulo).
+GAN_HISTORY_COLUMNS = ("d_loss_real", "d_loss_fake", "d_loss", "g_loss")
+WGAN_HISTORY_COLUMNS = ("critic_loss", "wasserstein_estimate", "gradient_penalty", "g_loss",
+                        "critic_steps", "generator_steps")  # fmt: skip
 
 
 def make_config(variant: str, seed: int = SEED):
     """Configuración de la GAN para la variante dada (importa keras vía ``amp_gan.gan``)."""
     from amp_gan.gan import GANConfig
+
+    if variant == "wgan_gp":
+        from amp_gan.wgan_gp import WGANConfig
+
+        return WGANConfig(seed=seed)
 
     if variant == "base":
         return GANConfig(seed=seed)
@@ -101,6 +123,8 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--snapshot-every", type=int, default=SNAPSHOT_EVERY)
     p.add_argument("--n-eval", type=int, default=N_EVAL)
     p.add_argument("--seed", type=int, default=SEED)
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="tope de pasos por época (solo pruebas rápidas; por defecto, una pasada por los datos)")  # fmt: skip
     p.add_argument("--out-dir", type=Path, default=PROCESSED, help="carpeta de salida")
     p.add_argument("--auto-backend", action="store_true",
                    help="medir backends/dispositivos disponibles y usar el más rápido (por defecto: CPU)")  # fmt: skip
@@ -140,9 +164,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[run_gan_base:{args.variant}] datos: {X.shape} ({len(df):,} secuencias)", flush=True)
 
     config = make_config(args.variant, args.seed)
+    train_fn = None  # None: train_gan
+    history_columns = GAN_HISTORY_COLUMNS
+    if args.variant == "wgan_gp":
+        from amp_gan.wgan_gp import train_wgan_gp
+
+        train_fn, history_columns = train_wgan_gp, WGAN_HISTORY_COLUMNS
     res = run_gan_experiment(
         X, df, config, epochs=args.epochs, snapshot_every=args.snapshot_every,
-        n_eval=args.n_eval, eval_seed=args.seed,
+        n_eval=args.n_eval, eval_seed=args.seed, max_steps_per_epoch=args.max_steps, train_fn=train_fn,
     )  # fmt: skip
     device_used = weights_device(res.history.generator)
     print(f"[run_gan_base:{args.variant}] pesos del generador en: {device_used}", flush=True)
@@ -156,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
 
     hist = pd.DataFrame(
         {"epoch": np.arange(1, args.epochs + 1)}
-        | {k: res.history[k] for k in ("d_loss_real", "d_loss_fake", "d_loss", "g_loss")}
+        | {k: res.history[k] for k in history_columns}
     )
     hist.to_csv(out / f"{prefix}_history.csv", index=False, float_format="%.8g")
 
@@ -194,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         "variant": args.variant,
         "config": asdict(config),
         "epochs": args.epochs,
+        "max_steps_per_epoch": args.max_steps,
         "snapshot_every": args.snapshot_every,
         "snapshot_epochs": res.snapshot_epochs,
         "n_eval": args.n_eval,
@@ -201,8 +232,13 @@ def main(argv: list[str] | None = None) -> int:
         "train_fasta": TRAIN_FASTA.name,
         "n_train": int(X.shape[0]),
         "timing_s": res.timing,
-        "final_epoch_losses": {k: res.history[k][-1] for k in ("d_loss_real", "d_loss_fake", "g_loss")},
+        "final_epoch_losses": {k: res.history[k][-1] for k in history_columns if k != "d_loss"},
     }
+    if args.variant == "wgan_gp":
+        info["epoch_definition"] = (
+            "una época = n // batch_size pasos de crítico (cada uno con un lote real distinto); "
+            f"el generador se actualiza una vez cada {config.n_critic} pasos de crítico"
+        )
     (out / f"{prefix}_run_info.json").write_text(
         json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )

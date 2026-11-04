@@ -9,6 +9,14 @@ instantáneas usan el mismo ruido) y calcula
 decodificación: ``"argmax"`` y ``"sample"`` (muestreo categórico por posición,
 con ``default_rng(eval_seed)``).
 
+Por defecto entrena con :func:`amp_gan.gan.train_gan`; el parámetro opcional
+``train_fn`` permite evaluar otro modelo con exactamente el mismo protocolo (por
+ejemplo :func:`amp_gan.wgan_gp.train_wgan_gp`). Solo hace falta que ``train_fn``
+tenga la misma firma que ``train_gan`` (``X, config, epochs, *,
+max_steps_per_epoch, callback``), que el historial que devuelva tenga los modelos
+en el atributo ``generator`` y que ``config`` tenga ``latent_dim`` y ``seed``
+(los usa :func:`amp_gan.gan.generate_probs`).
+
 Este módulo importa Keras (a través de :mod:`amp_gan.gan`): el backend debe
 fijarse antes con :mod:`amp_gan.runtime`.
 """
@@ -16,13 +24,14 @@ fijarse antes con :mod:`amp_gan.runtime`.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
 from amp_gan.evaluation import build_reference, evaluate_sequences
-from amp_gan.gan import GANConfig, GANHistory, generate_probs, sample_sequences, train_gan
+from amp_gan.gan import GANConfig, generate_probs, sample_sequences, train_gan
 
 #: Modos de decodificación evaluados, en este orden.
 MODES: tuple[str, ...] = ("argmax", "sample")
@@ -33,8 +42,8 @@ class ExperimentResult:
     """Resultado de :func:`run_gan_experiment`.
 
     Attributes:
-        history: historial de pérdidas de :func:`amp_gan.gan.train_gan` (con
-            los modelos entrenados en ``history.generator``, etc.).
+        history: historial de pérdidas de :func:`amp_gan.gan.train_gan` (o de
+            ``train_fn``), con los modelos entrenados en ``history.generator``, etc.
         metrics: DataFrame con una fila por (``epoch``, ``mode``) y las
             columnas ``epoch`` (empieza en 1), ``mode`` y las métricas de
             :data:`amp_gan.evaluation.METRIC_NAMES`.
@@ -48,7 +57,7 @@ class ExperimentResult:
         snapshot_epochs: épocas (desde 1) en las que se tomó instantánea.
     """
 
-    history: GANHistory
+    history: dict
     metrics: pd.DataFrame
     sequences: dict[str, list[str]]
     timing: dict[str, float]
@@ -75,6 +84,7 @@ def run_gan_experiment(
     n_eval: int,
     eval_seed: int,
     max_steps_per_epoch: int | None = None,
+    train_fn: Callable | None = None,
 ) -> ExperimentResult:
     """Entrena la GAN y evalúa instantáneas a lo largo del entrenamiento.
 
@@ -82,12 +92,13 @@ def run_gan_experiment(
         X: datos de entrenamiento ``(n, seq_len, vocab_size)``.
         reference_df: DataFrame con columna ``sequence`` (secuencias reales de
             referencia para las métricas).
-        config: configuración de la GAN.
+        config: configuración de la GAN (``GANConfig``, o la que espere ``train_fn``).
         epochs: número de épocas.
         snapshot_every: cada cuántas épocas se evalúa (además de la 1 y la última).
         n_eval: secuencias generadas por instantánea y modo.
         eval_seed: semilla del ruido y del muestreo de la evaluación.
         max_steps_per_epoch: tope de pasos por época (solo para pruebas rápidas).
+        train_fn: función de entrenamiento; ``None`` usa :func:`amp_gan.gan.train_gan`.
 
     Returns:
         :class:`ExperimentResult`.
@@ -117,7 +128,8 @@ def run_gan_experiment(
             eval_seconds += time.perf_counter() - now
         mark = time.perf_counter()
 
-    history = train_gan(
+    train = train_gan if train_fn is None else train_fn
+    history = train(
         X, config, epochs, max_steps_per_epoch=max_steps_per_epoch, callback=_callback
     )
     total = time.perf_counter() - start
