@@ -192,14 +192,17 @@ _ROOT = Path(__file__).resolve().parents[2]
 _PROCESSED = _ROOT / "context" / "data" / "processed"
 
 # Subproceso que reproduce el entrenamiento de run_gan_base.py (backend y
-# dispositivo del benchmark, configuración por defecto, semilla 42) durante 10 épocas.
+# dispositivo de la ejecución original, configuración por defecto, semilla 42) durante 10 épocas.
+# Recibe la raíz del proyecto, el backend y el dispositivo ("cpu" o "gpu").
 _REPRO_SNIPPET = """
 import json, sys
 from pathlib import Path
 root = Path(sys.argv[1])
 sys.path.insert(0, str(root / "src"))
 from amp_gan import runtime
-runtime.apply_fastest(root / "context/data/processed/benchmark_results.csv", batch_size=128)
+runtime.set_backend(sys.argv[2])
+if sys.argv[3] == "cpu":
+    runtime.use_cpu_only()
 from amp_gan.encoding import load_encoded
 from amp_gan.gan import GANConfig, train_gan
 env = runtime.describe_environment()
@@ -217,29 +220,31 @@ def test_default_config_reproduces_base_history_exactly():
     """Con ``GANConfig()`` las 10 primeras épocas son idénticas a ``gan_base_history.csv``.
 
     Se ejecuta en un subproceso con el backend y el dispositivo de la ejecución
-    original (``runtime.apply_fastest``), porque la igualdad exacta solo tiene
-    sentido en el mismo entorno. Se salta si faltan los datos (no se versionan)
-    o si el entorno de esta máquina no coincide con el de ``gan_base_run_info.json``.
+    original (el de ``gan_base_run_info.json``), porque la igualdad exacta solo
+    tiene sentido en el mismo entorno. Se salta si faltan los datos (no se
+    versionan), si el backend original no está instalado o si el entorno de esta
+    máquina no coincide con el de ``gan_base_run_info.json`` (por ejemplo, sin GPU).
     """
     pd = pytest.importorskip("pandas")
     needed = [
         _PROCESSED / "gan_base_history.csv",
         _PROCESSED / "gan_base_run_info.json",
         _PROCESSED / "Antibacterial_amps_clean.fasta",
-        _PROCESSED / "benchmark_results.csv",
     ]
     missing = [f.name for f in needed if not f.is_file()]
     if missing:
         pytest.skip(f"Faltan datos generados (no se versionan): {missing}")
     info = json.loads((_PROCESSED / "gan_base_run_info.json").read_text(encoding="utf-8"))
     ref = pd.read_csv(_PROCESSED / "gan_base_history.csv", dtype=str).head(10)
+    if info["keras_backend"] not in runtime.installed_backends():
+        pytest.skip(f"Backend original no instalado: {info['keras_backend']}")
 
     env = dict(os.environ)
     env.pop("KERAS_BACKEND", None)
     if info.get("cuda_visible_devices") is None:
         env.pop("CUDA_VISIBLE_DEVICES", None)  # use_cpu_only() de este módulo la fijó a ""
     proc = subprocess.run(
-        [sys.executable, "-c", _REPRO_SNIPPET, str(_ROOT)],
+        [sys.executable, "-c", _REPRO_SNIPPET, str(_ROOT), info["keras_backend"], info["device_used"]],
         capture_output=True, text=True, env=env, timeout=600,
     )  # fmt: skip
     assert proc.returncode == 0, proc.stderr[-2000:]

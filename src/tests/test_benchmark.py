@@ -132,3 +132,22 @@ def test_run_benchmark_still_writes_csv(monkeypatch, tmp_path):
     saved = pd.read_csv(out)
     assert list(saved.columns) == benchmark.CSV_COLUMNS
     assert len(saved) == len(df) == 1
+
+
+def test_collect_benchmark_defaults_to_available_candidates(monkeypatch):
+    """Sin ``candidates`` solo se miden las configuraciones disponibles en la máquina."""
+    from amp_gan import benchmark, runtime
+
+    calls = []
+    monkeypatch.setattr(benchmark, "_run_candidate", _fake_run_candidate(calls))
+    monkeypatch.setattr(runtime, "available_candidates", lambda *a, **k: [("torch", "cpu")])
+    df = benchmark.collect_benchmark(batch_sizes=(128,), steps=2, warmup=1)
+    assert [c[:2] for c in calls] == [("torch", "cpu")]
+    assert len(df) == 1
+
+
+def test_benchmark_cli_parses_all_flag():
+    from amp_gan import benchmark
+
+    assert benchmark._parse([]).all is False
+    assert benchmark._parse(["--all"]).all is True

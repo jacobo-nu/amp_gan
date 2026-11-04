@@ -6,6 +6,8 @@ Uso (desde la raíz del proyecto)::
     python src/amp_gan/run_gan_base.py --variant stabilized     # estabilizada (gan_stab_*)
     python src/amp_gan/run_gan_base.py --variant stabilized_const  # ablación: ruido constante (gan_stabc_*)
     python src/amp_gan/run_gan_base.py --epochs 10 --out-dir carpeta_de_prueba
+    python src/amp_gan/run_gan_base.py --auto-backend           # mide y usa el backend/dispositivo más rápido
+    python src/amp_gan/run_gan_base.py --backend torch          # fuerza el backend (también AMP_GAN_BACKEND=torch)
 
 ``--variant base`` (por defecto) usa ``GANConfig()``, la línea base y prefijo
 ``gan_base``; ``--variant stabilized`` usa ``GANConfig.stabilized()`` (suavizado
@@ -16,8 +18,14 @@ ruido de instancia constante en 0,1, sin decaer) y prefijo ``gan_stabc``. El
 protocolo es idéntico en todas. Más abajo, ``gan_base_*`` se
 refiere al prefijo de la variante elegida.
 
-Pasos: aplica ``runtime.apply_fastest`` (backend y dispositivo más rápidos según
-``benchmark_results.csv``, lote 128) ANTES de importar Keras; entrena con la
+Pasos: elige el backend y el dispositivo ANTES de importar Keras. Por defecto usa
+la **CPU** (``runtime.apply_cpu_default``: TensorFlow si está instalado, si no
+torch; se puede forzar con ``--backend`` o ``AMP_GAN_BACKEND``), de modo que
+funciona en cualquier máquina sin depender de archivos generados antes. Con
+``--auto-backend`` (``runtime.apply_auto_backend``) mide en esta máquina los
+backends/dispositivos disponibles (prueba reducida, lote 128) y usa el más
+rápido; si no hay GPU utilizable o la prueba falla, cae a la CPU y lo indica.
+No se lee ``benchmark_results.csv``. Después entrena con la
 configuración de la variante (sin ajustar hiperparámetros) durante 200 épocas con instantáneas cada 20 y 2000 secuencias por
 evaluación; escribe en ``context/data/processed/`` (formato estable, usado por
 la comparación de la Fase 3):
@@ -41,8 +49,9 @@ la comparación de la Fase 3):
     registros (una secuencia vacía aparece como línea vacía).
 ``gan_base_run_info.json``
     versiones (python, numpy, pandas, scipy, keras, tensorflow, torch), backend
-    y dispositivo usados, decisión del benchmark, configuración de la GAN,
-    épocas, parámetros de evaluación, tamaño de los datos y tiempos (s).
+    y dispositivo usados (``device_used`` es el medido en los pesos),
+    ``backend_mode`` (``cpu`` o ``auto``) y ``backend_decision`` (decisión y mensaje),
+    configuración de la GAN, épocas, parámetros de evaluación, tamaño de los datos y tiempos (s).
 
 No se guardan los pesos de los modelos.
 """
@@ -64,7 +73,6 @@ from amp_gan import runtime  # noqa: E402  (no importa keras)
 
 PROCESSED = PROJECT_ROOT / "context" / "data" / "processed"
 TRAIN_FASTA = PROCESSED / "Antibacterial_amps_clean.fasta"
-BENCHMARK_CSV = PROCESSED / "benchmark_results.csv"
 
 EPOCHS = 200
 SNAPSHOT_EVERY = 20
@@ -94,6 +102,10 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--n-eval", type=int, default=N_EVAL)
     p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--out-dir", type=Path, default=PROCESSED, help="carpeta de salida")
+    p.add_argument("--auto-backend", action="store_true",
+                   help="medir backends/dispositivos disponibles y usar el más rápido (por defecto: CPU)")  # fmt: skip
+    p.add_argument("--backend", choices=runtime.SUPPORTED_BACKENDS, default=None,
+                   help="fuerza el backend de Keras (también AMP_GAN_BACKEND)")  # fmt: skip
     return p.parse_args(argv)
 
 
@@ -102,8 +114,11 @@ def main(argv: list[str] | None = None) -> int:
     prefix = VARIANTS[args.variant]
 
     # 1) Backend y dispositivo ANTES de importar keras.
-    choice = runtime.apply_fastest(BENCHMARK_CSV, batch_size=128)
-    print(f"[run_gan_base:{args.variant}] decisión del benchmark: {choice['message']}", flush=True)
+    if args.auto_backend:
+        choice, _ = runtime.apply_auto_backend(backend=args.backend, batch_sizes=(runtime.TRAIN_BATCH_SIZE,))
+    else:
+        choice = runtime.apply_cpu_default(args.backend)
+    print(f"[run_gan_base:{args.variant}] {choice['message']}", flush=True)
 
     # 2) Ahora sí: keras y los módulos que lo importan.
     import numpy as np
@@ -131,6 +146,9 @@ def main(argv: list[str] | None = None) -> int:
     )  # fmt: skip
     device_used = weights_device(res.history.generator)
     print(f"[run_gan_base:{args.variant}] pesos del generador en: {device_used}", flush=True)
+    if device_used != choice["device"]:
+        print(f"[run_gan_base:{args.variant}] AVISO: se decidió {choice['device']} pero los pesos "
+              f"están en {device_used}.", flush=True)  # fmt: skip
 
     # 3) Salidas.
     out = Path(args.out_dir)
@@ -171,9 +189,8 @@ def main(argv: list[str] | None = None) -> int:
         "gpu_visible": env["gpu_visible"],
         "cuda_visible_devices": env["cuda_visible_devices"],
         "device_used": device_used,
-        "benchmark_decision": {
-            k: (list(v) if isinstance(v, tuple) else v) for k, v in choice.items()
-        },
+        "backend_mode": choice["mode"],
+        "backend_decision": choice,
         "variant": args.variant,
         "config": asdict(config),
         "epochs": args.epochs,

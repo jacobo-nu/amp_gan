@@ -5,8 +5,16 @@ SUBPROCESO independiente (con ``sys.executable``, ``KERAS_BACKEND`` y
 ``CUDA_VISIBLE_DEVICES`` fijados en su entorno) que mide el paso de
 entrenamiento de :mod:`amp_gan.gan` con el mismo modelo (configuración por
 defecto), los mismos datos (Antibacterial limpio codificado) y la misma semilla,
-para cada tamaño de lote. El resultado se guarda en
-``context/data/processed/benchmark_results.csv``.
+para cada tamaño de lote. Por defecto solo se miden los candidatos
+disponibles en esta máquina (:func:`amp_gan.runtime.available_candidates`: backends
+instalados y GPU solo si se detecta); ``--all`` mide además los no disponibles
+(quedan como filas de error, útil para diagnóstico).
+
+Como CLI escribe un informe opcional en ``context/data/processed/benchmark_results.csv``.
+Ese CSV es solo informativo y específico de la máquina donde se generó: NINGÚN
+código ni notebook lo lee para decidir el backend. La decisión en tiempo de
+ejecución la toma :func:`amp_gan.runtime.apply_auto_backend` (opcional) midiendo
+en memoria.
 
 Uso (desde la raíz del proyecto)::
 
@@ -43,7 +51,8 @@ _PROJECT_ROOT = _SRC_DIR.parent
 DEFAULT_FASTA = _PROJECT_ROOT / "context" / "data" / "processed" / "Antibacterial_amps_clean.fasta"
 DEFAULT_CSV = _PROJECT_ROOT / "context" / "data" / "processed" / "benchmark_results.csv"
 
-#: Configuraciones candidatas ``(backend, dispositivo)``.
+#: Todas las configuraciones posibles ``(backend, dispositivo)``. Por defecto se miden
+#: solo las disponibles en la máquina (``runtime.available_candidates``).
 CANDIDATES: tuple[tuple[str, str], ...] = (
     ("tensorflow", "cpu"),
     ("torch", "cpu"),
@@ -345,7 +354,7 @@ def _run_candidate(backend, device, batch_sizes, steps, warmup, fasta) -> list[d
 
 
 def collect_benchmark(
-    candidates=CANDIDATES,
+    candidates=None,
     batch_sizes=BATCH_SIZES,
     steps: int = DEFAULT_STEPS,
     warmup: int = DEFAULT_WARMUP,
@@ -359,13 +368,18 @@ def collect_benchmark(
     un notebook) se puede reducir ``steps`` (pasos medidos) y ``warmup``.
 
     Args:
-        candidates: configuraciones ``(backend, dispositivo)``.
+        candidates: configuraciones ``(backend, dispositivo)``; por defecto las
+            disponibles en esta máquina (:func:`amp_gan.runtime.available_candidates`).
         batch_sizes: tamaños de lote a medir.
         steps: nº de pasos medidos por configuración y lote.
         warmup: pasos de calentamiento (no medidos).
         fasta: FASTA limpio con los datos de la medición.
         verbose: si es ``True`` imprime el progreso.
     """
+    if candidates is None:
+        from amp_gan import runtime
+
+        candidates = runtime.available_candidates()
     rows = []
     for backend, device in candidates:
         if verbose:
@@ -381,14 +395,14 @@ def collect_benchmark(
 
 
 def run_benchmark(
-    candidates=CANDIDATES,
+    candidates=None,
     batch_sizes=BATCH_SIZES,
     steps: int = DEFAULT_STEPS,
     warmup: int = DEFAULT_WARMUP,
     fasta: Path = DEFAULT_FASTA,
     csv_path: Path = DEFAULT_CSV,
 ) -> pd.DataFrame:
-    """Ejecuta todas las configuraciones, escribe el CSV y devuelve el DataFrame."""
+    """Ejecuta las configuraciones, escribe el CSV (informe opcional) y devuelve el DataFrame."""
     df = collect_benchmark(candidates, batch_sizes, steps, warmup, fasta, verbose=True)
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -433,6 +447,8 @@ def _parse(argv=None) -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     p.add_argument("--fasta", type=Path, default=DEFAULT_FASTA)
     p.add_argument("--out", type=Path, default=DEFAULT_CSV)
+    p.add_argument("--all", action="store_true",
+                   help="medir también los candidatos no disponibles (filas de error)")  # fmt: skip
     args = p.parse_args(argv)
     args.batch_sizes = [int(b) for b in str(args.batch_sizes).split(",") if b]
     return args
@@ -443,8 +459,8 @@ def main(argv=None) -> int:
     if args.child:
         return _child_main(args)
     df = run_benchmark(
-        batch_sizes=args.batch_sizes, steps=args.steps, warmup=args.warmup,
-        fasta=args.fasta, csv_path=args.out,
+        candidates=CANDIDATES if args.all else None, batch_sizes=args.batch_sizes,
+        steps=args.steps, warmup=args.warmup, fasta=args.fasta, csv_path=args.out,
     )  # fmt: skip
     report(df)
     print(f"\nCSV: {args.out}")
