@@ -1,9 +1,12 @@
 numpy
 pandas
+scipy
 scikit-learn
 matplotlib
-tensorflow
 keras
-biopython
+tensorflow
+torch
 jupyterlab
 pytest
+nbclient
+ipykernel
