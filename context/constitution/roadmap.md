@@ -27,7 +27,7 @@ Estado: `[ ]` pendiente · `[~]` en curso · `[x]` hecho
 - [x] Ablación con ruido de instancia constante (sección h del notebook 02, `--variant stabilized_const`): W1 de longitud 3,85 y longitud media 19,0 aa, sin deriva (criterio fijado de antemano cumplido: ≤ 8,3 y cociente época 200/100 ≤ 1,25). Respalda que el decaimiento del ruido causaba la deriva; una sola ejecución, semilla 42. **Será la referencia de la Fase 3** (GAN vanilla estabilizada con ruido constante)
 
 ## Fase 3 — Mejoras
-- [ ] WGAN-GP
+- [x] WGAN-GP (`src/amp_gan/wgan_gp.py`, penalización de gradiente para TensorFlow y torch; notebook 03, sección a). Una ejecución, semilla 42, época 200, modo sample: frente a la referencia (estabilizada con ruido constante) mejora la W1 de longitud (3,85 → 1,15), de carga (1,23 → 0,45) y la composición (0,097 → 0,074), pero empeora ligeramente la de hidrofobicidad (0,085 → 0,095); cumple 4 de las 5 condiciones fijadas de antemano, así que no se declara mejor. Aun así queda más cerca de los datos reales que la referencia en 3 de 4 métricas, y entrena más rápido por época que la vanilla en CPU
 - [ ] GAN condicional con condición numérica: primero longitud, luego hidrofobicidad y después las dos. Rangos «habituales» = percentiles 10–90 de Antibacterial_amps (limpia). Se construye sobre la vanilla estabilizada con ruido constante y se compara con ella
 - [ ] Notebook 03: comparación de variantes
 
