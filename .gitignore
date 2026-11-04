@@ -38,3 +38,6 @@ runs/
 
 # Archivos temporales del sistema de tareas programadas
 .claude/scheduled_tasks.lock
+
+# Trabajos para entregar (no se versionan)
+entregas/
