@@ -27,7 +27,9 @@ por defecto de :class:`GANConfig` el comportamiento es el de la vanilla pura):
    :class:`InstanceNoise` al inicio de D, activa solo con ``training=True``, es
    decir, en el paso de D con muestras reales y falsas y en el paso de G). Su
    desviación típica decrece linealmente de ``instance_noise_std`` a 0 en
-   ``instance_noise_decay_epochs`` épocas (:func:`instance_noise_std_for_epoch`).
+   ``instance_noise_decay_epochs`` épocas (:func:`instance_noise_std_for_epoch`);
+   con ``instance_noise_decay=False`` se mantiene constante (ablación,
+   :meth:`GANConfig.stabilized_constant_noise`).
 3. Salida discreta diferenciable: entre G y D las muestras se discretizan a
    one-hot con Gumbel-softmax y *straight-through* (capa
    :class:`GumbelStraightThrough`): en la pasada hacia delante son one-hot
@@ -76,6 +78,7 @@ class GANConfig:
     real_label: float = 1.0  # etiqueta de las muestras reales en el paso de D
     instance_noise_std: float = 0.0  # desviación típica inicial del ruido de instancia
     instance_noise_decay_epochs: int = 100  # épocas hasta que el ruido llega a 0
+    instance_noise_decay: bool = True  # False: el ruido se mantiene en instance_noise_std (ablación)
     discretize: str = "none"  # "none" | "gumbel_st"
     gumbel_tau: float = 1.0  # temperatura del Gumbel-softmax
 
@@ -86,7 +89,7 @@ class GANConfig:
             raise ValueError(f"real_label debe estar en [0, 1], se recibió {self.real_label}.")
         if self.instance_noise_std < 0:
             raise ValueError(f"instance_noise_std no puede ser negativa ({self.instance_noise_std}).")
-        if self.instance_noise_std > 0 and self.instance_noise_decay_epochs < 1:
+        if self.instance_noise_std > 0 and self.instance_noise_decay and self.instance_noise_decay_epochs < 1:
             raise ValueError("instance_noise_decay_epochs debe ser >= 1 si hay ruido de instancia.")
         if self.gumbel_tau <= 0:
             raise ValueError(f"gumbel_tau debe ser > 0, se recibió {self.gumbel_tau}.")
@@ -110,6 +113,17 @@ class GANConfig:
         params.update(overrides)
         return cls(**params)
 
+    @classmethod
+    def stabilized_constant_noise(cls, **overrides) -> "GANConfig":
+        """Ablación de la estabilizada: igual que :meth:`stabilized` pero con ruido de instancia constante.
+
+        La desviación del ruido permanece en ``instance_noise_std`` (0,1) durante
+        todo el entrenamiento (``instance_noise_decay=False``); es el único cambio
+        respecto a :meth:`stabilized`. ``overrides`` permite cambiar otros campos.
+        """
+        params = dict(instance_noise_decay=False)
+        params.update(overrides)
+        return cls.stabilized(**params)
 
 
 class GANHistory(dict):
@@ -128,11 +142,15 @@ def instance_noise_std_for_epoch(config: GANConfig, epoch: int) -> float:
     """Desviación típica del ruido de instancia en la época ``epoch`` (desde 0).
 
     Decrece linealmente desde ``instance_noise_std`` (época 0) hasta 0 en la
-    época ``instance_noise_decay_epochs`` y vale 0 a partir de ella. Con la
-    configuración por defecto (``instance_noise_std = 0``) es siempre 0.
+    época ``instance_noise_decay_epochs`` y vale 0 a partir de ella. Con
+    ``instance_noise_decay=False`` es constante e igual a ``instance_noise_std``
+    en todas las épocas. Con la configuración por defecto
+    (``instance_noise_std = 0``) es siempre 0.
     """
     if config.instance_noise_std <= 0:
         return 0.0
+    if not config.instance_noise_decay:
+        return float(config.instance_noise_std)
     frac = 1.0 - float(epoch) / config.instance_noise_decay_epochs
     return float(config.instance_noise_std * max(0.0, frac))
 

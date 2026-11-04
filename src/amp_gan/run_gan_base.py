@@ -4,12 +4,16 @@ Uso (desde la raíz del proyecto)::
 
     python src/amp_gan/run_gan_base.py                          # vanilla pura (gan_base_*)
     python src/amp_gan/run_gan_base.py --variant stabilized     # estabilizada (gan_stab_*)
+    python src/amp_gan/run_gan_base.py --variant stabilized_const  # ablación: ruido constante (gan_stabc_*)
     python src/amp_gan/run_gan_base.py --epochs 10 --out-dir carpeta_de_prueba
 
 ``--variant base`` (por defecto) usa ``GANConfig()``, la línea base y prefijo
 ``gan_base``; ``--variant stabilized`` usa ``GANConfig.stabilized()`` (suavizado
 de etiquetas, ruido de instancia y Gumbel-softmax straight-through) y prefijo
-``gan_stab``. El protocolo es idéntico en ambas. Más abajo, ``gan_base_*`` se
+``gan_stab``; ``--variant stabilized_const`` usa
+``GANConfig.stabilized_constant_noise()`` (igual que la estabilizada pero con el
+ruido de instancia constante en 0,1, sin decaer) y prefijo ``gan_stabc``. El
+protocolo es idéntico en todas. Más abajo, ``gan_base_*`` se
 refiere al prefijo de la variante elegida.
 
 Pasos: aplica ``runtime.apply_fastest`` (backend y dispositivo más rápidos según
@@ -66,7 +70,20 @@ EPOCHS = 200
 SNAPSHOT_EVERY = 20
 N_EVAL = 2000
 SEED = 42
-VARIANTS = {"base": "gan_base", "stabilized": "gan_stab"}
+VARIANTS = {"base": "gan_base", "stabilized": "gan_stab", "stabilized_const": "gan_stabc"}
+
+
+def make_config(variant: str, seed: int = SEED):
+    """Configuración de la GAN para la variante dada (importa keras vía ``amp_gan.gan``)."""
+    from amp_gan.gan import GANConfig
+
+    if variant == "base":
+        return GANConfig(seed=seed)
+    if variant == "stabilized":
+        return GANConfig.stabilized(seed=seed)
+    if variant == "stabilized_const":
+        return GANConfig.stabilized_constant_noise(seed=seed)
+    raise ValueError(f"Variante desconocida: {variant!r}.")
 
 
 def _parse(argv: list[str] | None = None) -> argparse.Namespace:
@@ -98,7 +115,6 @@ def main(argv: list[str] | None = None) -> int:
     from amp_gan.encoding import load_encoded
     from amp_gan.evaluation import reference_floors
     from amp_gan.experiment import MODES, run_gan_experiment
-    from amp_gan.gan import GANConfig
 
     env = runtime.describe_environment()
     print(f"[run_gan_base:{args.variant}] backend={env['keras_backend']} dispositivos={env['keras_devices']}", flush=True)
@@ -108,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     X, df = load_encoded(TRAIN_FASTA)
     print(f"[run_gan_base:{args.variant}] datos: {X.shape} ({len(df):,} secuencias)", flush=True)
 
-    config = GANConfig(seed=args.seed) if args.variant == "base" else GANConfig.stabilized(seed=args.seed)
+    config = make_config(args.variant, args.seed)
     res = run_gan_experiment(
         X, df, config, epochs=args.epochs, snapshot_every=args.snapshot_every,
         n_eval=args.n_eval, eval_seed=args.seed,

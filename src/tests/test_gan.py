@@ -451,3 +451,72 @@ def test_stabilized_training_is_reproducible_on_cpu(real_data):
     other = train_gan(real_data, GANConfig.stabilized(seed=1, gen_hidden=(16,), disc_hidden=(16,), batch_size=_BATCH),
                       epochs=2, max_steps_per_epoch=3)  # fmt: skip
     assert other["g_loss"] != h1["g_loss"]
+
+
+# ---------------------------------------------------------------------------
+# Ablación: ruido de instancia constante
+# ---------------------------------------------------------------------------
+
+
+def test_constant_noise_config_differs_from_stabilized_only_in_decay_flag():
+    c = GANConfig.stabilized_constant_noise(seed=7)
+    s = GANConfig.stabilized(seed=7)
+    assert c.instance_noise_decay is False and s.instance_noise_decay is True
+    assert GANConfig().instance_noise_decay is True  # por defecto, retrocompatible
+    assert {**c.__dict__, "instance_noise_decay": True} == s.__dict__
+    assert (c.real_label, c.instance_noise_std, c.discretize, c.gumbel_tau) == (0.9, 0.1, "gumbel_st", 1.0)
+    assert GANConfig.stabilized_constant_noise(seed=3).seed == 3  # overrides
+
+
+def test_constant_noise_std_is_the_same_in_every_epoch():
+    c = GANConfig.stabilized_constant_noise()
+    vals = [instance_noise_std_for_epoch(c, e) for e in range(0, 300)]
+    assert all(v == 0.1 for v in vals)
+
+
+def test_default_decay_schedule_unchanged_by_the_new_flag():
+    c = GANConfig.stabilized()
+    assert [instance_noise_std_for_epoch(c, e) for e in (0, 50, 99, 100, 150)] == pytest.approx(
+        [0.1, 0.05, 0.001, 0.0, 0.0], abs=1e-12
+    )
+    assert instance_noise_std_for_epoch(GANConfig(instance_noise_std=0.1, instance_noise_decay=True), 100) == 0.0
+
+
+def test_constant_noise_validation():
+    # Sin decaimiento, instance_noise_decay_epochs deja de importar.
+    GANConfig(instance_noise_std=0.1, instance_noise_decay=False, instance_noise_decay_epochs=0)
+    # Con decaimiento sigue siendo obligatorio >= 1.
+    with pytest.raises(ValueError, match="instance_noise_decay_epochs"):
+        GANConfig(instance_noise_std=0.1, instance_noise_decay_epochs=0)
+    with pytest.raises(ValueError, match="instance_noise_std"):
+        GANConfig.stabilized_constant_noise(instance_noise_std=-0.1)
+
+
+def test_train_gan_keeps_the_noise_std_constant(real_data):
+    cfg = GANConfig.stabilized_constant_noise(gen_hidden=(16,), disc_hidden=(16,), batch_size=_BATCH,
+                                              instance_noise_decay_epochs=4)  # fmt: skip
+    models = build_models(cfg)
+    layer = next(m for m in models[1].layers if isinstance(m, InstanceNoise))
+    seen = []
+    train_gan(
+        real_data, cfg, epochs=7, models=models, max_steps_per_epoch=1,
+        callback=lambda epoch, gen: seen.append(float(keras.ops.convert_to_numpy(layer.std))),
+    )  # fmt: skip
+    np.testing.assert_allclose(seen, [0.1] * 7, atol=1e-6)
+
+
+def test_runner_registers_the_constant_noise_variant():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "amp_gan" / "run_gan_base.py"
+    spec = importlib.util.spec_from_file_location("run_gan_base", path)
+    run_gan_base = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run_gan_base)  # el script no importa keras al cargarse
+
+    assert run_gan_base.VARIANTS["stabilized_const"] == "gan_stabc"
+    assert run_gan_base.VARIANTS["base"] == "gan_base" and run_gan_base.VARIANTS["stabilized"] == "gan_stab"
+    assert len(set(run_gan_base.VARIANTS.values())) == len(run_gan_base.VARIANTS)
+    assert run_gan_base.make_config("stabilized_const", 5) == GANConfig.stabilized_constant_noise(seed=5)
+    assert run_gan_base.make_config("stabilized", 5) == GANConfig.stabilized(seed=5)
+    assert run_gan_base.make_config("base", 5) == GANConfig(seed=5)
+    assert run_gan_base._parse(["--variant", "stabilized_const"]).variant == "stabilized_const"
