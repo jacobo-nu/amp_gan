@@ -3,36 +3,47 @@
 Uso (desde la raíz del proyecto)::
 
     python src/amp_gan/run_conditional_gan.py --variant cgan_length --auto-backend   # ejecución completa
-    python src/amp_gan/run_conditional_gan.py --variant cgan_length --epochs 3 --max-steps 20 --out-dir carpeta_de_prueba
+    python src/amp_gan/run_conditional_gan.py --variant cgan_hydro --auto-backend    # ídem, hidrofobicidad
+    python src/amp_gan/run_conditional_gan.py --variant cgan_hydro --epochs 3 --max-steps 20 --out-dir carpeta_de_prueba
 
-Variante ``cgan_length`` (prefijo ``cgan_length``): condición = longitud
-normalizada ``(L - 5) / 55`` sobre la base ``GANConfig.stabilized_constant_noise()``
-(ver :mod:`amp_gan.conditional_gan`). Se entrena con TODAS las longitudes (5-60);
-los objetivos que se piden y evalúan son los percentiles 10, 30, 50, 70 y 90 de la
-longitud real (9, 13, 20, 21 y 40 aa; el rango «habitual» p10-p90 es 9-40 aa), con
-tolerancia de acierto de ±2 aa. Protocolo idéntico al de ``run_gan_base.py``: 200
-épocas, instantáneas cada 20 (y la primera), 2000 secuencias por evaluación,
-semilla 42, sin ajustar hiperparámetros. Selección de backend igual que en
-``run_gan_base.py`` (por defecto CPU; ``--auto-backend`` mide y usa el más rápido;
+Variantes (sobre la base ``GANConfig.stabilized_constant_noise()``, ver :mod:`amp_gan.conditional_gan`):
+
+``cgan_length`` (prefijo ``cgan_length``)
+    condición = longitud normalizada ``(L - 5) / 55``. Se entrena con TODAS las longitudes
+    (5-60); los objetivos que se piden y evalúan son los percentiles 10, 30, 50, 70 y 90 de
+    la longitud real (9, 13, 20, 21 y 40 aa; el rango «habitual» p10-p90 es 9-40 aa), con
+    tolerancia de acierto de ±2 aa.
+``cgan_hydro`` (prefijo ``cgan_hydro``)
+    condición = hidrofobicidad media de Kyte-Doolittle (GRAVY) normalizada con el mínimo y el
+    máximo del entrenamiento. Se entrena con TODOS los valores de GRAVY; los objetivos son los
+    percentiles 10, 30, 50, 70 y 90 del GRAVY real (sin redondear), con tolerancia de acierto
+    de ±0,25. En la evaluación por objetivos las propiedades secundarias son la longitud y la
+    carga neta.
+
+Protocolo idéntico al de ``run_gan_base.py``: 200 épocas, instantáneas cada 20 (y la primera),
+2000 secuencias por evaluación, semilla 42, sin ajustar hiperparámetros. Selección de backend
+igual que en ``run_gan_base.py`` (por defecto CPU; ``--auto-backend`` mide y usa el más rápido;
 ``--backend`` lo fuerza).
 
-Archivos escritos en ``context/data/processed/`` (o ``--out-dir``), con prefijo ``cgan_length``:
+Archivos escritos en ``context/data/processed/`` (o ``--out-dir``), con el prefijo de la variante
+(aquí ``P``):
 
-``cgan_length_history.csv``
+``P_history.csv``
     columnas ``epoch``, ``d_loss_real``, ``d_loss_fake``, ``d_loss``, ``g_loss`` (como la base).
-``cgan_length_metrics.csv``
-    evaluación (i) «empírica»: condiciones tomadas de longitudes reales (muestreo con
+``P_metrics.csv``
+    evaluación (i) «empírica»: condiciones tomadas de valores reales (muestreo con
     reposición de los datos de entrenamiento, semilla 42). Mismo formato que el de las
     demás variantes (filas por época y modo, más los suelos ``real_subset`` y ``random_uniform``).
-``cgan_length_targets.csv``
+``P_targets.csv``
     evaluación (ii) por objetivos: una fila por (``epoch``, ``mode``, ``target``) con las
-    columnas de :data:`amp_gan.conditions.TARGET_COLUMNS`.
-``cgan_length_generated_{sample,argmax}.fasta``
+    columnas de :func:`amp_gan.conditions.target_columns` de la propiedad pedida.
+``P_generated_{sample,argmax}.fasta``
     las 2000 secuencias de la evaluación (i) en la última época (ids ``gen_0000`` ...).
-``cgan_length_generated_targets_sample.fasta``
-    las 2000 secuencias pedidas con cada objetivo en la última época, modo sample
-    (ids ``gen_t09_0000``, ``gen_t13_0000``, ...).
-``cgan_length_run_info.json``
+``P_generated_targets_sample.fasta``
+    las 2000 secuencias pedidas con cada objetivo en la última época, modo sample (ids
+    ``gen_t09_0000``, ``gen_t13_0000``, ... para la longitud; ``gen_g-1.465_0000``,
+    ``gen_g-0.730_0000``, ... para el GRAVY).
+``P_run_info.json``
     versiones, backend y dispositivo, configuración, condiciones, objetivos, tiempos y las
     referencias sin condición de la evaluación por objetivos.
 
@@ -64,7 +75,19 @@ from amp_gan.run_gan_base import (  # noqa: E402  (no importa keras)
 )
 
 #: Variantes: nombre -> (prefijo de archivos, condiciones numéricas).
-VARIANTS: dict[str, tuple[str, tuple[str, ...]]] = {"cgan_length": ("cgan_length", ("length",))}
+VARIANTS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "cgan_length": ("cgan_length", ("length",)),
+    "cgan_hydro": ("cgan_hydro", ("hydrophobicity",)),
+}
+
+#: Propiedad que se pide en la evaluación por objetivos de cada variante.
+TARGET_PROPERTY: dict[str, str] = {"cgan_length": "length", "cgan_hydro": "hydrophobicity"}
+
+#: Descripción de las condiciones de la evaluación (i) (para ``run_info.json``).
+EVAL_CONDITIONS: dict[str, str] = {
+    "length": "longitudes reales muestreadas con reposicion (default_rng(eval_seed)) de los datos de entrenamiento",
+    "hydrophobicity": "GRAVY reales muestreados con reposicion (default_rng(eval_seed)) de los datos de entrenamiento",
+}
 
 #: GAN de referencia sin condicionar, de la que se leen las secuencias para la comparación por objetivos.
 REFERENCE_PREFIX = "gan_stabc"
@@ -118,13 +141,15 @@ def main(argv: list[str] | None = None) -> int:
     from amp_gan.benchmark import weights_device
     from amp_gan.conditional_gan import run_conditional_experiment
     from amp_gan.conditions import (
-        HIT_TOLERANCE,
         TARGET_PERCENTILES,
-        length_percentiles,
+        default_tolerance,
+        property_percentiles,
+        property_values,
         real_ceiling,
-        target_lengths,
+        target_label,
+        target_values,
         unconditional_target_table,
-        usual_length_range,
+        usual_range,
     )
     from amp_gan.data import read_fasta, write_fasta
     from amp_gan.encoding import load_encoded
@@ -139,15 +164,21 @@ def main(argv: list[str] | None = None) -> int:
     X, df = load_encoded(TRAIN_FASTA)
     print(f"[{tag}] datos: {X.shape} ({len(df):,} secuencias)", flush=True)
 
-    real_lengths = df["sequence"].str.len().to_numpy()
-    targets = target_lengths(real_lengths)
-    usual = usual_length_range(real_lengths)
-    print(f"[{tag}] objetivos (percentiles {TARGET_PERCENTILES}): {targets}; rango habitual p10-p90: {usual}", flush=True)
+    prop = TARGET_PROPERTY[args.variant]
+    tol = default_tolerance(prop)
+    real_values = property_values(df["sequence"], prop)
+    targets = target_values(real_values, prop)
+    usual = usual_range(real_values)  # percentiles 10-90 sin redondear
+    if prop == "length":
+        usual = (int(round(usual[0])), int(round(usual[1])))
+    print(f"[{tag}] objetivos de {prop} (percentiles {TARGET_PERCENTILES}): {targets}; "
+          f"rango habitual p10-p90: {usual}; tolerancia de acierto: {tol}", flush=True)  # fmt: skip
 
     config = make_config(args.variant, args.seed)
     res = run_conditional_experiment(
         X, df, config, epochs=args.epochs, snapshot_every=args.snapshot_every, n_eval=args.n_eval,
-        eval_seed=args.seed, targets=targets, tol=HIT_TOLERANCE, max_steps_per_epoch=args.max_steps,
+        eval_seed=args.seed, targets=targets, tol=tol, max_steps_per_epoch=args.max_steps,
+        target_property=prop,
     )  # fmt: skip
     device_used = weights_device(res.history.generator)
     print(f"[{tag}] pesos del generador en: {device_used}", flush=True)
@@ -179,16 +210,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     ids, seqs_t = [], []
     for t, seqs in res.target_sequences["sample"].items():
-        ids += [f"gen_t{t:02d}_{i:04d}" for i in range(len(seqs))]
+        ids += [f"gen_{target_label(prop, t)}_{i:04d}" for i in range(len(seqs))]
         seqs_t += seqs
     write_fasta(pd.DataFrame({"id": ids, "sequence": seqs_t}), out / f"{prefix}_generated_targets_sample.fasta")
 
     # Referencias sin condición de la evaluación por objetivos (la GAN de referencia, si está generada).
-    references: dict = {"real_ceiling": real_ceiling(real_lengths, targets).to_dict(orient="list")}
+    references: dict = {"real_ceiling": real_ceiling(real_values, targets, tol).to_dict(orient="list")}
     ref_fasta = PROCESSED / f"{REFERENCE_PREFIX}_generated_sample.fasta"
     if ref_fasta.exists():
         ref_seqs = read_fasta(ref_fasta)["sequence"].tolist()
-        references[REFERENCE_PREFIX] = unconditional_target_table(ref_seqs, targets).to_dict(orient="list")
+        references[REFERENCE_PREFIX] = unconditional_target_table(ref_seqs, targets, tol, prop).to_dict(orient="list")
 
     info = {
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -209,17 +240,19 @@ def main(argv: list[str] | None = None) -> int:
         "variant": args.variant,
         "config": asdict(config),
         "condition_spec": res.history.spec.to_dict(),
-        "target_percentiles": {str(k): v for k, v in length_percentiles(real_lengths).items()},
-        "target_lengths": list(targets),
-        "usual_length_range_p10_p90": list(usual),
-        "hit_tolerance": HIT_TOLERANCE,
+        "target_property": prop,
+        "target_percentiles": {str(k): v for k, v in property_percentiles(real_values).items()},
+        "target_values": list(targets),
+        "usual_range_p10_p90": list(usual),
+        **({"target_lengths": list(targets), "usual_length_range_p10_p90": list(usual)} if prop == "length" else {}),
+        "hit_tolerance": tol,
         "epochs": args.epochs,
         "max_steps_per_epoch": args.max_steps,
         "snapshot_every": args.snapshot_every,
         "snapshot_epochs": res.snapshot_epochs,
         "n_eval": args.n_eval,
         "eval_seed": args.seed,
-        "eval_conditions": "longitudes reales muestreadas con reposicion (default_rng(eval_seed)) de los datos de entrenamiento",
+        "eval_conditions": EVAL_CONDITIONS[prop],
         "train_fasta": TRAIN_FASTA.name,
         "n_train": int(X.shape[0]),
         "timing_s": res.timing,

@@ -379,12 +379,15 @@ def test_experiment_supports_hydrophobicity_and_both_conditions(seqs, real_data)
 
 
 def test_run_conditional_gan_script_registry_and_parser():
-    assert run_conditional_gan.VARIANTS == {"cgan_length": ("cgan_length", ("length",))}
+    assert run_conditional_gan.VARIANTS == {
+        "cgan_length": ("cgan_length", ("length",)),
+        "cgan_hydro": ("cgan_hydro", ("hydrophobicity",)),
+    }
     args = run_conditional_gan._parse(["--variant", "cgan_length", "--epochs", "3", "--auto-backend"])
     assert args.variant == "cgan_length" and args.epochs == 3 and args.auto_backend is True
     assert (args.snapshot_every, args.n_eval, args.seed, args.max_steps) == (20, 2000, 42, None)
     with pytest.raises(SystemExit):
-        run_conditional_gan._parse(["--variant", "cgan_hydrophobicity"])  # solo la de longitud está registrada
+        run_conditional_gan._parse(["--variant", "cgan_both"])  # todavía no está registrada la de longitud + hidrofobicidad
     cfg = run_conditional_gan.make_config("cgan_length")
     assert cfg.conditions == ("length",) and cfg.real_label == 0.9 and cfg.instance_noise_decay is False
 

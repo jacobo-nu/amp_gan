@@ -35,10 +35,11 @@ fija; modos ``argmax`` y ``sample``):
     reposición (``default_rng(eval_seed)``) de los datos de entrenamiento, así que
     las métricas son las de :data:`amp_gan.evaluation.METRIC_NAMES`, comparables
     con las variantes sin condicionar.
-(ii) **por objetivos** (solo si la condición incluye ``length`` y se dan
-    ``targets``): ``n_eval`` secuencias pedidas con cada longitud objetivo
+(ii) **por objetivos** (solo si se dan ``targets`` y la condición incluye la
+    propiedad ``target_property``, ``length`` por defecto o ``hydrophobicity``):
+    ``n_eval`` secuencias pedidas con cada valor objetivo de esa propiedad
     (ver :func:`amp_gan.conditions.evaluate_target`). Si hay otras condiciones
-    además de la longitud, esas columnas se fijan en la mediana real normalizada.
+    además de la pedida, esas columnas se fijan en la mediana real normalizada.
 
 Este módulo importa Keras: el backend debe fijarse antes con :mod:`amp_gan.runtime`.
 """
@@ -54,13 +55,15 @@ import numpy as np
 import pandas as pd
 
 from amp_gan.conditions import (
-    HIT_TOLERANCE,
-    TARGET_COLUMNS,
     ConditionSpec,
     build_target_references,
     check_condition_names,
+    check_target_property,
     condition_spec_from_encoded,
+    default_tolerance,
     evaluate_target,
+    target_columns,
+    target_key,
 )
 from amp_gan.evaluation import build_reference, evaluate_sequences
 from amp_gan.experiment import MODES, snapshot_epochs
@@ -307,15 +310,15 @@ def empirical_condition_indices(n_train: int, n_eval: int, eval_seed: int) -> np
 
 
 def target_condition_matrix(
-    spec: ConditionSpec, target: float, n: int, fixed_raw: Sequence[float] | None = None
+    spec: ConditionSpec, target: float, n: int, fixed_raw: Sequence[float] | None = None, prop: str = "length"
 ) -> np.ndarray:
-    """Condiciones normalizadas ``(n, k)`` que piden longitud ``target``.
+    """Condiciones normalizadas ``(n, k)`` que piden ``prop = target`` (longitud o GRAVY reales).
 
     Las demás condiciones (si las hay) se fijan en ``fixed_raw`` (valores reales,
-    en el orden de ``spec.names``; la posición de ``length`` se ignora).
+    en el orden de ``spec.names``; la posición de ``prop`` se ignora).
     """
     raw = np.zeros(spec.k, dtype="float64") if fixed_raw is None else np.asarray(fixed_raw, dtype="float64").copy()
-    raw[spec.names.index("length")] = target
+    raw[spec.names.index(check_target_property(prop))] = target
     return np.repeat(spec.normalize(raw)[None, :], n, axis=0)
 
 
@@ -331,10 +334,11 @@ class ConditionalExperimentResult:
         metrics: evaluación (i): una fila por (``epoch``, ``mode``) con las métricas de
             :data:`amp_gan.evaluation.METRIC_NAMES`.
         targets: evaluación (ii): una fila por (``epoch``, ``mode``, objetivo) con las
-            columnas de :data:`amp_gan.conditions.TARGET_COLUMNS` (vacío si no hay objetivos).
+            columnas de :func:`amp_gan.conditions.target_columns` de ``target_property``
+            (:data:`~amp_gan.conditions.TARGET_COLUMNS` para la longitud; vacío si no hay objetivos).
         sequences: secuencias de la evaluación (i) en la última instantánea, por modo.
         target_sequences: secuencias de la última instantánea por modo y objetivo
-            (``{modo: {t: [...]}}``).
+            (``{modo: {t: [...]}}``; ``t`` entero para la longitud y ``float`` para el GRAVY).
         condition_indices: índices reales usados en la evaluación (i).
         timing, epoch_seconds, snapshot_epochs: como en :class:`amp_gan.experiment.ExperimentResult`.
     """
@@ -358,9 +362,10 @@ def run_conditional_experiment(
     snapshot_every: int,
     n_eval: int,
     eval_seed: int,
-    targets: Sequence[int] | None = None,
-    tol: float = HIT_TOLERANCE,
+    targets: Sequence[float] | None = None,
+    tol: float | None = None,
     max_steps_per_epoch: int | None = None,
+    target_property: str = "length",
 ) -> ConditionalExperimentResult:
     """Entrena la GAN condicional y evalúa instantáneas ((i) empírica y (ii) por objetivos).
 
@@ -370,19 +375,24 @@ def run_conditional_experiment(
         config: :class:`ConditionalGANConfig`.
         epochs, snapshot_every, n_eval, eval_seed, max_steps_per_epoch: como en
             :func:`amp_gan.experiment.run_gan_experiment`.
-        targets: longitudes objetivo de (ii); ``None`` omite (ii) (obligatorio si la condición no incluye ``length``).
-        tol: tolerancia de la tasa de acierto.
+        targets: valores objetivo de (ii) para ``target_property``; ``None`` omite (ii), que
+            también se omite si la condición no incluye esa propiedad.
+        tol: tolerancia de la tasa de acierto (``None``: la fijada para ``target_property``,
+            2 aa para la longitud y 0,25 para el GRAVY).
+        target_property: propiedad que se pide en (ii): ``"length"`` (por defecto) o ``"hydrophobicity"``.
     """
     if len(reference_df) != X.shape[0]:
         raise ValueError("reference_df y X deben tener las mismas secuencias en el mismo orden.")
-    use_targets = bool(targets) and "length" in config.conditions
+    check_target_property(target_property)
+    tol = default_tolerance(target_property) if tol is None else tol
+    use_targets = bool(targets) and target_property in config.conditions
     epochs_to_eval = set(snapshot_epochs(epochs, snapshot_every))
     reference = build_reference(reference_df)
     real_seqs = reference_df["sequence"].tolist()
     spec, conds_all = condition_spec_from_encoded(config.conditions, np.asarray(X, dtype="float32"))
     idx_eval = empirical_condition_indices(X.shape[0], n_eval, eval_seed)
     conds_eval = conds_all[idx_eval]
-    target_refs = build_target_references(real_seqs, targets, tol) if use_targets else {}
+    target_refs = build_target_references(real_seqs, targets, tol, prop=target_property) if use_targets else {}
     fixed_raw = spec.denormalize(np.median(conds_all, axis=0)) if use_targets else None
 
     rows: list[dict] = []
@@ -407,12 +417,15 @@ def run_conditional_experiment(
                 final[mode] = seqs
             if use_targets:
                 for t in targets:
-                    tp = generate_conditional_probs(generator, target_condition_matrix(spec, t, n_eval, fixed_raw), config, seed=eval_seed)
-                    ref_t, n_ref = target_refs[int(t)]
+                    cond_t = target_condition_matrix(spec, t, n_eval, fixed_raw, prop=target_property)
+                    tp = generate_conditional_probs(generator, cond_t, config, seed=eval_seed)
+                    key = target_key(target_property, t)
+                    ref_t, n_ref = target_refs[key]
                     for mode in MODES:
                         seqs = sample_sequences(tp, rng=np.random.default_rng(eval_seed), mode=mode)
-                        target_rows.append({"epoch": epoch, "mode": mode, **evaluate_target(seqs, t, ref_t, n_ref, tol)})
-                        final_targets.setdefault(mode, {})[int(t)] = seqs
+                        row = evaluate_target(seqs, t, ref_t, n_ref, tol, prop=target_property)
+                        target_rows.append({"epoch": epoch, "mode": mode, **row})
+                        final_targets.setdefault(mode, {})[key] = seqs
             eval_seconds += time.perf_counter() - now
         mark = time.perf_counter()
 
@@ -426,7 +439,7 @@ def run_conditional_experiment(
         "mean_epoch_s": float(np.mean(epoch_seconds)),
         "median_epoch_s": float(np.median(epoch_seconds)),
     }
-    targets_df = pd.DataFrame(target_rows, columns=["epoch", "mode", *TARGET_COLUMNS])
+    targets_df = pd.DataFrame(target_rows, columns=["epoch", "mode", *target_columns(target_property)])
     return ConditionalExperimentResult(
         history=history,
         metrics=pd.DataFrame(rows),
