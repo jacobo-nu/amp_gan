@@ -35,3 +35,6 @@ runs/
 # Bases de datos DRAMP (no se redistribuyen; ver context/data/README.md)
 *.fasta
 *.fa
+
+# Archivos temporales del sistema de tareas programadas
+.claude/scheduled_tasks.lock
