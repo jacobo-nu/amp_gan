@@ -3,7 +3,6 @@
 Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](context/constitution/roadmap.md).
 
 ## Ahora
-- [ ] Fijar versiones en `requirements.txt` tras verificarlo en un entorno limpio
 - [ ] Fase 3: WGAN-GP y condicional numérica (longitud → hidrofobicidad → ambas, percentiles 10–90)
 
 ## Siguiente (Fase 1 — Datos)
@@ -18,10 +17,9 @@ Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](
 ## Pendiente de decidir
 - [ ] Documentar cómo ejecutar notebooks y tests (el cwd debe estar dentro del proyecto); `pytest`, `jupyterlab`, `nbclient` e `ipykernel` ya están en `requirements.txt`
 - [ ] GPU con TensorFlow: no detecta la RTX 3060 (está compilado contra CUDA 12 y el entorno tiene CUDA 13). **Aparcado por decisión del usuario (4-nov-2026)**: se usa torch en GPU y TensorFlow solo en CPU; retomar solo si hiciera falta TensorFlow con GPU
-- [ ] Estabilidad: `keras-nightly` y `tensorflow 2.22.0rc0` no son versiones estables; fijar versiones al estabilizar
+- [ ] Estabilidad: `keras-nightly` y `tensorflow 2.22.0rc0` no son versiones estables. `requirements.txt` ya fija versiones exactas, verificadas el 4-nov-2026 en un entorno limpio con Python 3.14.9 (190 tests); `keras-nightly` aporta el paquete `keras` (no instalar `keras` aparte). Riesgos: solo verificado en Python 3.14, y si la versión nightly desapareciera de PyPI habría que repetir la verificación con otra
 - [ ] Biopython: ¿quitarlo de `requirements.txt`? (el lector FASTA es propio)
 - [ ] `pyproject.toml` para instalar el paquete (ahora `src/tests/conftest.py` añade `src/` al path) y documentar el entorno
-- [ ] Fijar versiones en `requirements.txt`
 - [ ] Licencia del repositorio
 
 ## Hecho

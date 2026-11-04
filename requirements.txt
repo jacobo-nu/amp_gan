@@ -1,12 +1,15 @@
-numpy
-pandas
-scipy
-scikit-learn
-matplotlib
-keras
-tensorflow
-torch
-jupyterlab
-pytest
-nbclient
-ipykernel
+# Versiones verificadas con Python 3.14.9 en un entorno limpio (tests y notebooks).
+# TensorFlow 2.22.0rc0 depende de keras-nightly, que ya aporta el paquete `keras`:
+# por eso se fija keras-nightly y no `keras` (instalar los dos mezclaría ficheros).
+numpy==2.5.4
+pandas==3.1.0
+scipy==1.18.1
+scikit-learn==1.9.1
+matplotlib==3.11.2
+keras-nightly==3.16.0.dev2026100704
+tensorflow==2.22.0rc0
+torch==2.15.0
+jupyterlab==4.6.5
+pytest==9.2.0
+nbclient==0.11.0
+ipykernel==7.4.0

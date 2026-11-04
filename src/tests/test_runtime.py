@@ -405,3 +405,70 @@ def test_auto_respects_forced_backend(monkeypatch, clean_env):
     d, _ = runtime.apply_auto_backend(verbose=False)
     assert seen["c"] == (("torch", "cpu"), ("torch", "gpu"))
     assert (d["backend"], d["device"]) == ("torch", "gpu")
+
+
+# --------------------------------------------------------------------------- #
+# _list_devices: ruta de recurso cuando keras.distribution.list_devices falla
+# --------------------------------------------------------------------------- #
+def _fake_keras(backend, list_devices=None):
+    """Keras simulado; con ``list_devices=None`` imita a Keras estable + torch."""
+    distribution = None if list_devices is None else types.SimpleNamespace(list_devices=list_devices)
+    return types.SimpleNamespace(
+        distribution=distribution,
+        backend=types.SimpleNamespace(backend=lambda: backend),
+        __version__="0",
+    )
+
+
+def test_list_devices_uses_keras_api_when_available():
+    keras = _fake_keras("torch", lambda: ["gpu:0", "gpu:1"])
+    assert runtime._list_devices(keras) == ["gpu:0", "gpu:1"]
+
+
+def test_list_devices_torch_fallback_with_gpu(monkeypatch):
+    cuda = types.SimpleNamespace(is_available=lambda: True, device_count=lambda: 2)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+    # keras.distribution es None -> AttributeError: 'NoneType' ... 'list_devices'
+    assert runtime._list_devices(_fake_keras("torch")) == ["gpu:0", "gpu:1"]
+
+
+def test_list_devices_torch_fallback_without_gpu(monkeypatch):
+    cuda = types.SimpleNamespace(is_available=lambda: False, device_count=lambda: 0)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+    assert runtime._list_devices(_fake_keras("torch")) == ["cpu:0"]
+
+
+def _tf_device(device_type, index):
+    return types.SimpleNamespace(device_type=device_type, name=f"/device:{device_type}:{index}")
+
+
+def test_list_devices_tensorflow_fallback_prefers_accelerators(monkeypatch):
+    devices = [_tf_device("CPU", 0), _tf_device("GPU", 0)]
+    config = types.SimpleNamespace(list_logical_devices=lambda: devices)
+    monkeypatch.setitem(sys.modules, "tensorflow", types.SimpleNamespace(config=config))
+    assert runtime._list_devices(_fake_keras("tensorflow")) == ["gpu:0"]
+    devices[:] = [_tf_device("CPU", 0)]
+    assert runtime._list_devices(_fake_keras("tensorflow")) == ["cpu:0"]
+
+
+def test_list_devices_falls_back_to_cpu_if_everything_fails(monkeypatch):
+    def boom():
+        raise RuntimeError("sin dispositivos")
+
+    monkeypatch.setitem(sys.modules, "torch", None)  # import torch -> ImportError
+    assert runtime._list_devices(_fake_keras("torch")) == ["cpu:0"]
+    assert runtime._list_devices(_fake_keras("torch", boom)) == ["cpu:0"]
+    assert runtime._list_devices(_fake_keras("jax")) == ["cpu:0"]
+
+
+def test_list_devices_format_matches_keras_api_in_current_environment():
+    """Con el Keras instalado: el recurso y la API original (si existe) coinciden."""
+    keras = pytest.importorskip("keras")
+    got = runtime._list_devices(keras)
+    assert got and all(isinstance(d, str) and ":" in d and d == d.lower() for d in got)
+    if keras.distribution is not None:
+        try:
+            original = [str(d) for d in keras.distribution.list_devices()]
+        except Exception:
+            return
+        assert got == original

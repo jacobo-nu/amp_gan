@@ -141,6 +141,41 @@ def _version(dist: str) -> str | None:
         return None
 
 
+def _list_devices(keras) -> list[str]:
+    """Dispositivos que Keras ve, como cadenas ``"gpu:0"``, ``"cpu:0"``...
+
+    Usa ``keras.distribution.list_devices()``. Con Keras estable y backend torch esa
+    función no existe (``keras.distribution`` es ``None`` en su implementación y
+    lanza ``AttributeError``); entonces se reproduce su criterio consultando el
+    backend (que ya está cargado, pues Keras lo importa): si hay dispositivos
+    aceleradores solo se devuelven esos (``gpu:i``); si no, ``cpu:0``. Si nada
+    funciona devuelve ``["cpu:0"]``.
+    """
+    try:
+        return [str(d) for d in keras.distribution.list_devices()]
+    except Exception:
+        pass
+    try:
+        backend = keras.backend.backend()
+        if backend == "torch":
+            import torch
+
+            if torch.cuda.is_available():
+                return [f"gpu:{i}" for i in range(torch.cuda.device_count())]
+        elif backend == "tensorflow":
+            import tensorflow as tf
+
+            logical = tf.config.list_logical_devices()
+            others = [d for d in logical if d.device_type.lower() != "cpu"]
+            chosen = others or [d for d in logical if d.device_type.lower() == "cpu"]
+            names = [f"{d.device_type.lower()}:{d.name.split(':')[-1]}" for d in chosen]
+            if names:
+                return names
+    except Exception:
+        pass
+    return ["cpu:0"]
+
+
 def describe_environment() -> dict:
     """Describe el entorno de ejecución (importa keras de forma perezosa).
 
@@ -153,7 +188,7 @@ def describe_environment() -> dict:
     """
     import keras
 
-    devices = [str(d) for d in keras.distribution.list_devices()]
+    devices = _list_devices(keras)
     return {
         "keras_backend": keras.backend.backend(),
         "keras_devices": devices,
