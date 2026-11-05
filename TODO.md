@@ -2,15 +2,25 @@
 
 Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](context/constitution/roadmap.md).
 
+## Estado para retomar (2026-11-05 18:07 CET)
+- **Git:** todo el trabajo está fusionado en `main` (ff-only) salvo lo que se indique. El último `git push origin main` del usuario falló a las 16:00 UTC con `remote: Internal Server Error` de GitHub (fallo del servidor, el repositorio local pasa `git fsck`); hay que **reintentar `git push origin main`**. No cambiar de rama desde VS Code mientras trabaja un ejecutor.
+- **Hecho en Fase 3:** WGAN-GP (notebook 03), condicional por longitud (04, criterios A y B cumplidos), condicional por hidrofobicidad (05: criterio A cumplido con el A.2 revisado después de ver el resultado, B no cumplido) y agente ejecutor con modelo local (`src/amp_agents/`), más cinco roles locales evaluados (ver abajo). 541 tests.
+- **Modelos en Ollama** (los tres grandes anteriores se borraron el 2026-11-05): `qwen3:4b` (ejecutor, herramientas), `llama3.2:3b` (herramientas), `phi4-mini` (herramientas), `qwen2.5-coder:7b` (herramientas; se pasa un 9 % a CPU en la GPU de 6 GB), `gemma3:4b` (sin herramientas), `nomic-embed-text` (embeddings).
+
+## Propuestas pendientes de decisión (2026-11-05 18:07 CET)
+Contexto: la evaluación en vivo de los cinco roles locales (criterios fijados de antemano, resultados en el roadmap) no cumplió ninguno; el resumidor y el revisor con corrección de línea son los candidatos útiles. Segunda iteración propuesta, en una rama nueva (p. ej. `feat/local-roles-2`), con **los mismos criterios** y el mismo protocolo (`src/amp_agents/eval_roles.py`):
+- [ ] **1. Localizador (`llama3.2:3b`, 10 % de aciertos):** sustituirlo por una herramienta determinista (lo que hace es `grep`); el modelo solo lo empeora. Decidir si el rol se elimina o se reasigna.
+- [ ] **2. Verificador de coherencia (`phi4-mini`, 0 % de citas válidas; no llama a herramientas e inventa citas):** probarlo en modo `single_shot`, con los dos documentos dentro del mensaje y sin herramientas.
+- [ ] **3. Revisor de código (`qwen2.5-coder:7b`, 1,0 de 5 defectos; 1,7 con un ajuste):** añadir un verificador que reasigne la línea buscando la cita literal en el fichero (el modelo acierta el texto pero desplaza el número); no detectó nunca los defectos de validación ni de argumentos intercambiados.
+- [ ] **4. Resumidor (`gemma3:4b`, cifras 97,8 % e idioma bien, pero hasta 246 palabras frente a 150):** recortar por código a 150 palabras o cambiar la definición («unas 120 palabras» no se cumple); usa punto decimal en lugar de coma.
+- [ ] **5. Recuperador (`nomic-embed-text`, 60 % top-3 frente a 73 % de BM25):** usar BM25 como recuperador por defecto y dejar los embeddings como opción. Probar un modelo de embeddings mejor para castellano, `bge-m3` (~1,2 GB), **requiere permiso del usuario para descargarlo** (pendiente).
+- [ ] Más repeticiones (ahora 2–3) para que las diferencias entre ajustes sean concluyentes.
+- [ ] Limpieza señalada por el ejecutor: el aviso fijo `DATA_NOTICE` de `agents.py` menciona un apartado «Fallos» que no existe en los roles de salida JSON.
+
 ## Ahora
-- [x] Fase 3, WGAN-GP: hecha en `feat/wgan-gp` (4 de 5 condiciones frente a la referencia; ver roadmap). Pendiente de fusionar con `main`
-- [x] Fase 3, GAN condicional por longitud: hecha en `feat/conditional-gan` (criterios A y B cumplidos; ver roadmap). Pendiente de fusionar con `main`
-- [x] Fase 3, GAN condicional por hidrofobicidad: hecha en `feat/conditional-hydrophobicity` (criterio A cumplido con el A.2 revisado tras el resultado, B no cumplido; ver roadmap). Pendiente de fusionar con `main`
-- [ ] Fase 3, GAN condicional por longitud e hidrofobicidad a la vez (percentiles 10–90)
+- [ ] Fase 3, GAN condicional por longitud e hidrofobicidad a la vez (percentiles 10–90). Plan: conservar los criterios de longitud, usar el A.2 revisado (`conditions.mae_vs_reference`) para las dos propiedades y fijar todos los criterios antes de entrenar; comparar con las dos condicionales y con la referencia `gan_stabc`
 - [ ] Notebook nuevo: la condicional por ambas y la comparación final de variantes (los notebooks 03 WGAN-GP, 04 longitud y 05 hidrofobicidad ya están hechos, uno por experimento)
-- [x] Agente ejecutor con modelo local hecho en `feat/local-agent` (`src/amp_agents/`; ver roadmap). Pendiente de fusionar con `main`
-- [x] Integrar por rol los modelos locales descargados: hecho en `feat/local-roles`, evaluación en vivo sin cumplir los criterios (ver roadmap)
-- [ ] Segunda iteración de roles locales: localizador como herramienta determinista, doc_checker en una pasada, corrección de línea del revisor por código, BM25 como recuperador por defecto; repetir la evaluación con los mismos criterios
+- [ ] Trabajo de entrega (`entregas/primer_trabajo/Primer_Trabajo_Biofísica.ipynb`, fuera de git): el usuario lo revisa a mano; límite 2026-11-14, objetivo entregar esta semana; pulidos pendientes: minúscula tras «Qué se observa.», separador de miles, «Siguientes pasos» menciona cosas ya hechas, tiempo en CPU solo estimado
 
 ## Siguiente (Fase 1 — Datos)
 - [ ] Escribir el script de descarga reproducible en `src/amp_gan/`
