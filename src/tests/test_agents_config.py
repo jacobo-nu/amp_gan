@@ -36,7 +36,7 @@ def test_config_file_has_commented_examples_for_other_models():
     text = (SRC / "amp_agents" / "agents.toml").read_text(encoding="utf-8")
     assert "# [agents.executor_14b]" in text and "# [agents.executor_server]" in text
     assert "llama.cpp" in text and "vLLM" in text
-    assert list(load_config()["agents"]) == ["executor"]
+    assert list(load_config()["agents"]) == ["executor", "locator", "doc_checker", "code_reviewer", "summarizer", "retriever"]
 
 
 def test_config_errors(tmp_path):
@@ -100,7 +100,7 @@ def test_policy_from_config_default_denies_processed_writes(tmp_path):
     policy = A.make_policy(get_agent_config("executor"), project)
     with pytest.raises(Exception):
         policy.check("context/data/processed/x.csv", "write")
-    allowed = A.make_policy(AgentConfig(name="x", model="m", tools=["read_file"], allow_write_processed=True), project)
+    allowed = A.make_policy(AgentConfig(name="x", model="m", tools=["read_file", "write_file"], allow_write_processed=True), project)
     assert allowed.check("context/data/processed/x.csv", "write")
 
 

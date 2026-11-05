@@ -10,6 +10,7 @@ cambiar de proveedor (o de configuración), no de código.
 - :class:`OllamaProvider`: API nativa de Ollama (``POST {base_url}/api/chat``). Existe porque el
   endpoint compatible con OpenAI de Ollama no permite fijar el contexto (``num_ctx``, 4096 por defecto) ni
   desactivar el razonamiento de modelos como qwen3 (``think``); el resto del sistema no nota la diferencia.
+  Además ofrece ``embed`` (``POST /api/embed``) para modelos de embeddings.
 - :class:`ScriptedProvider`: respuestas predefinidas, sin red (para tests).
 """
 
@@ -349,6 +350,40 @@ class OllamaProvider(ChatProvider):
             usage = Usage(int(data.get("prompt_eval_count") or 0), int(data.get("eval_count") or 0))
         content, calls = _merge_text_calls(message.get("content") or "", calls)
         return AssistantMessage(content=content, tool_calls=calls, usage=usage, reasoning=message.get("thinking") or "", finish_reason=str(data.get("done_reason") or ""))
+
+    def embed(self, texts: Sequence[str], timeout: float | None = None) -> list[list[float]]:
+        """Vectores de incrustación de ``texts`` (``POST {base_url}/api/embed``), uno por texto y en el mismo orden.
+
+        Pensado para modelos de embeddings como ``nomic-embed-text``. De ``options`` solo se usan las opciones
+        del modelo (p. ej. ``num_ctx``) y ``keep_alive``/``truncate`` (primer nivel); ``think`` y ``num_predict``
+        no tienen sentido aquí y se ignoran. Lanza :class:`ProviderError` si la respuesta no trae un vector
+        numérico por texto, y :class:`ProviderTimeout` si se agota el tiempo.
+        """
+        items = [texts] if isinstance(texts, str) else list(texts)
+        if not items:
+            return []
+        if not all(isinstance(t, str) for t in items):
+            raise ProviderError("embed solo admite textos (cadenas)")
+        options = dict(self.options)
+        body: dict[str, Any] = {"model": self.model, "input": items}
+        for key in ("keep_alive", "truncate"):
+            if key in options:
+                body[key] = options.pop(key)
+        options.pop("think", None)
+        options.pop("num_predict", None)
+        if options:
+            body["options"] = options
+        limit = self.timeout if timeout is None else min(self.timeout, timeout)
+        data = post_json(f"{self.base_url}/api/embed", body, self.base_url, limit)
+        vectors = data.get("embeddings") if isinstance(data, dict) else None
+        if not isinstance(vectors, list) or len(vectors) != len(items):
+            raise ProviderError(f"respuesta de embed sin un vector por texto ({len(items)} esperados): {str(data)[:200]}")
+        out: list[list[float]] = []
+        for vector in vectors:
+            if not isinstance(vector, list) or not vector or not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in vector):
+                raise ProviderError(f"vector de embed no válido: {str(vector)[:100]}")
+            out.append([float(x) for x in vector])
+        return out
 
 
 class ScriptedProvider(ChatProvider):

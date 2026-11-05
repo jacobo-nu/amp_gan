@@ -29,6 +29,104 @@ pytest_timeout = 300
 num_ctx = 12288                 # contexto (el prompt de sistema + herramientas ya ocupan ~2000 tokens)
 temperature = 0.2
 
+# --- Roles acotados (solo lectura o de una pasada) -----------------------------------------------------
+# mode:
+#   "agent"        bucle con herramientas (solo las de `tools`; `write = []` = ninguna raíz de escritura)
+#   "single_shot"  una petición sin herramientas, con límite de tiempo (max_seconds) y de tokens (max_tokens)
+#   "embedding"    modelo de embeddings: no genera texto (indexa y busca; ver amp_agents.retrieval)
+# verifier: nombre de la comprobación automática de la salida (amp_agents.verifiers). La salida de estos roles
+# no se da por buena sin pasar por ella.
+# search_docs (herramienta de solo lectura) se puede añadir a `tools` de cualquier rol de modo agent; por defecto
+# ningún rol la tiene. search_backend = "lexical" (sin modelo) o "embedding" (usa el índice y el rol retriever).
+
+[agents.locator]
+mode = "agent"
+provider = "ollama"
+model = "llama3.2:3b"
+base_url = "http://localhost:11434"
+timeout = 120
+max_steps = 12
+max_seconds = 180
+max_tokens = 1024
+tools = ["list_dir", "grep", "read_file"]
+read = ["src", "context"]
+write = []
+verifier = "locator"
+
+[agents.locator.options]
+num_ctx = 8192
+temperature = 0.2
+
+[agents.doc_checker]
+mode = "agent"
+provider = "ollama"
+model = "phi4-mini"
+base_url = "http://localhost:11434"
+timeout = 240
+max_steps = 12
+max_seconds = 300
+max_tokens = 2048
+tools = ["read_file", "grep", "list_dir"]
+read = ["context", "src"]
+write = []
+verifier = "doc_checker"
+
+[agents.doc_checker.options]
+num_ctx = 12288
+temperature = 0.2
+
+[agents.code_reviewer]
+mode = "agent"
+provider = "ollama"
+model = "qwen2.5-coder:7b"
+base_url = "http://localhost:11434"
+timeout = 300
+max_steps = 10
+max_seconds = 420
+max_tokens = 2048
+tools = ["read_file", "grep", "list_dir"]
+read = ["src", "context"]
+write = []
+verifier = "code_reviewer"
+
+[agents.code_reviewer.options]
+num_ctx = 8192
+temperature = 0.2
+
+[agents.summarizer]
+mode = "single_shot"
+provider = "ollama"
+model = "gemma3:4b"
+base_url = "http://localhost:11434"
+timeout = 180
+max_seconds = 180
+max_tokens = 700
+tools = []
+read = ["context"]
+write = []
+verifier = "summarizer"
+
+[agents.summarizer.options]
+num_ctx = 8192
+temperature = 0.2
+
+[agents.retriever]
+mode = "embedding"
+provider = "ollama"
+model = "nomic-embed-text"
+base_url = "http://localhost:11434"
+timeout = 120
+max_seconds = 600
+max_tokens = 0
+tools = []
+read = ["context", "src"]
+write = []                      # solo escribe el índice, en index_dir (fuera del control de versiones)
+index_dir = ".agent_runs/index"
+verifier = "retriever"
+
+[agents.retriever.options]
+num_ctx = 2048
+
 # --- Ejemplos (descomenta y ajusta) -------------------------------------------------------------
 # Otro modelo local en Ollama (misma definición, mismo encargo):
 #

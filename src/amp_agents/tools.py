@@ -265,7 +265,7 @@ def _grep(policy: Policy, args: dict) -> str:
     except re.error as exc:
         raise ToolError(f"expresión regular no válida: {exc}") from exc
     base = policy.check(args.get("path", "src"), "list")
-    glob = args.get("glob", "*")
+    glob = args.get("glob") or "*"  # un filtro vacío (lo envían algunos modelos) equivale a «todos»
     limit = max(1, min(int(args.get("max_results", 50)), 200))
     files: list[Path] = []
     if base.is_file():

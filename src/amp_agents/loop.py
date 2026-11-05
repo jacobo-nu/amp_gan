@@ -11,6 +11,10 @@ Cada ejecución escribe un registro JSONL (un evento por línea: ``start``, ``as
 Motivos de parada: ``final`` (respuesta sin llamadas), ``max_steps``, ``timeout`` (límite de tiempo total;
 al proveedor se le pasa el tiempo que queda y cancela la petición en curso si se agota) y ``error`` (fallo
 del proveedor).
+
+``run_single_shot`` es la variante sin herramientas (una sola petición, con límite de tiempo y de tokens
+fijado en el proveedor); además de los anteriores usa ``length`` (el modelo agotó ``max_tokens``) y ``empty``
+(respuesta vacía).
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ class AgentResult:
         denied: llamadas rechazadas por la política (herramienta, argumentos y mensaje).
         tool_errors: número de llamadas a herramienta que devolvieron error (incluye las denegadas).
         error: mensaje del fallo si ``stop_reason == "error"``.
+        finish_reason: motivo de fin de la última respuesta del modelo según el servidor (``stop``, ``length``...).
         log_path: ruta del registro JSONL (``None`` si el registro está desactivado).
     """
 
@@ -60,6 +65,7 @@ class AgentResult:
     denied: list[dict] = field(default_factory=list)
     tool_errors: int = 0
     error: str | None = None
+    finish_reason: str = ""
     log_path: Path | None = None
 
 
@@ -77,6 +83,15 @@ class _Log:
         record = {"t": round(time.monotonic() - self._t0, 3), "event": kind, **data}
         with open(self.path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _log_path(log_dir: Path | str | bool | None, root: Path, run_label: str) -> Path | None:
+    """Ruta del registro JSONL de una ejecución (``None`` si ``log_dir`` es ``False``)."""
+    if log_dir is False:
+        return None
+    folder = Path(log_dir) if log_dir else Path(root) / DEFAULT_LOG_DIRNAME
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in run_label)
+    return folder / f"{time.strftime('%Y%m%d-%H%M%S')}_{safe}_{uuid.uuid4().hex[:6]}.jsonl"
 
 
 def _limit(text: str, max_chars: int) -> str:
@@ -115,12 +130,8 @@ def run_agent(
         metadata: datos libres que se guardan en el evento ``start``.
     """
     started = time.monotonic()
-    log_path = None
-    if log_dir is not False:
-        folder = Path(log_dir) if log_dir else policy.root / DEFAULT_LOG_DIRNAME
-        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in run_label)
-        log_path = folder / f"{time.strftime('%Y%m%d-%H%M%S')}_{safe}_{uuid.uuid4().hex[:6]}.jsonl"
-    log = _Log(log_path)
+    log = _Log(_log_path(log_dir, policy.root, run_label))
+    log_path = log.path
     by_name = {t.name: t for t in tools}
     definitions = [t.definition() for t in tools]
     messages: list[dict] = [{"role": "system", "content": system_prompt}, {"role": "user", "content": task}]
@@ -166,6 +177,7 @@ def run_agent(
             total.completion_tokens += reply.usage.completion_tokens
             result.last_prompt_tokens = reply.usage.prompt_tokens
         messages.append(reply.to_message())
+        result.finish_reason = reply.finish_reason
         if reply.content:
             result.report = reply.content
         log.event(
@@ -226,6 +238,81 @@ def run_agent(
         tools_called=result.tools_called,
         denied=result.denied,
         tool_errors=result.tool_errors,
+        error=result.error,
+        report=result.report,
+    )
+    return result
+
+
+def run_single_shot(
+    provider: ChatProvider,
+    system_prompt: str,
+    task: str,
+    max_seconds: float | None = 300.0,
+    log_dir: Path | str | bool | None = None,
+    run_label: str = "run",
+    root: Path | str | None = None,
+    metadata: dict | None = None,
+) -> AgentResult:
+    """Una sola petición al modelo, SIN herramientas, con límite de tiempo (``max_seconds``).
+
+    El tope de tokens lo fija el proveedor (``max_tokens`` -> ``num_predict``). Reutiliza el registro JSONL
+    (``start``, ``assistant``, ``end``). ``stop_reason``: ``final``, ``length`` (tope de tokens), ``empty``
+    (respuesta vacía), ``timeout`` o ``error``. Si el modelo pidiera herramientas, se ignoran.
+    """
+    started = time.monotonic()
+    log = _Log(_log_path(log_dir, Path(root) if root else Path.cwd(), run_label))
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": task}]
+    log.event(
+        "start",
+        provider=getattr(provider, "name", type(provider).__name__),
+        model=getattr(provider, "model", None),
+        tools=[],
+        mode="single_shot",
+        max_seconds=max_seconds,
+        metadata=metadata or {},
+        system_prompt=system_prompt,
+        task=task,
+    )
+    result = AgentResult(report="", steps=0, stop_reason="final", duration_s=0.0, log_path=log.path)
+    result.steps = 1
+    try:
+        reply = provider.chat(messages, None, timeout=max_seconds)
+    except ProviderTimeout as exc:
+        result.stop_reason, result.error = "timeout", str(exc)
+        log.event("error", step=1, message=str(exc), timeout=True)
+    except ProviderError as exc:
+        result.stop_reason, result.error = "error", str(exc)
+        log.event("error", step=1, message=str(exc))
+    else:
+        result.report = reply.content
+        result.finish_reason = reply.finish_reason
+        if reply.usage is not None:
+            result.tokens = Usage(reply.usage.prompt_tokens, reply.usage.completion_tokens)
+            result.last_prompt_tokens = reply.usage.prompt_tokens
+        if reply.finish_reason == "length":
+            result.stop_reason = "length"
+        elif not reply.content.strip():
+            result.stop_reason = "empty"
+        log.event(
+            "assistant",
+            step=1,
+            content=reply.content,
+            reasoning=reply.reasoning,
+            finish_reason=reply.finish_reason,
+            tool_calls=[],
+            usage=None if reply.usage is None else {"prompt": reply.usage.prompt_tokens, "completion": reply.usage.completion_tokens},
+        )
+    result.duration_s = time.monotonic() - started
+    log.event(
+        "end",
+        stop_reason=result.stop_reason,
+        steps=result.steps,
+        duration_s=round(result.duration_s, 3),
+        tokens=None if result.tokens is None else {"prompt": result.tokens.prompt_tokens, "completion": result.tokens.completion_tokens},
+        tools_called=[],
+        denied=[],
+        tool_errors=0,
         error=result.error,
         report=result.report,
     )
