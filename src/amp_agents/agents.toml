@@ -1,0 +1,53 @@
+# Configuración de agentes. La definición de cada agente está en context/agents/<nombre>.md y es la
+# misma para cualquier modelo; aquí solo se elige proveedor, modelo y permisos.
+#
+# provider:
+#   "ollama"        API nativa de Ollama (POST {base_url}/api/chat). Se usa por defecto porque permite fijar
+#                   el contexto (options.num_ctx); el endpoint /v1 de Ollama lo fija en 4096 y recorta el
+#                   historial en silencio.
+#   "ollama_openai" Ollama por su endpoint compatible con OpenAI (base_url con /v1; sin control de contexto).
+#   "openai_compat" | "llamacpp" | "vllm"   cualquier endpoint compatible con OpenAI
+#                   (POST {base_url}/chat/completions).
+# Si un servidor pide clave, indica el NOMBRE de una variable de entorno en api_key_env (nunca la clave aquí).
+
+[agents.executor]
+provider = "ollama"
+model = "qwen3:4b"
+base_url = "http://localhost:11434"
+timeout = 600          # segundos máximos (de reloj) de cada petición al modelo; al vencer se cancela
+max_steps = 25
+max_seconds = 900      # tiempo total de la ejecución; cancela también la petición en curso
+max_tokens = 8192      # tope de tokens por respuesta, razonamiento incluido (num_predict en Ollama)
+tools = ["list_dir", "read_file", "grep", "write_file", "edit_file", "run_pytest"]
+read = ["context", "src"]
+write = ["src"]
+allow_write_processed = false   # true permitiría escribir en context/data/processed/
+max_file_bytes = 200000
+pytest_timeout = 300
+
+[agents.executor.options]       # opciones del modelo (en "ollama": options de Ollama; en otros: campos del cuerpo)
+num_ctx = 12288                 # contexto (el prompt de sistema + herramientas ya ocupan ~2000 tokens)
+temperature = 0.2
+
+# --- Ejemplos (descomenta y ajusta) -------------------------------------------------------------
+# Otro modelo local en Ollama (misma definición, mismo encargo):
+#
+# [agents.executor_14b]
+# provider = "ollama"
+# model = "qwen2.5:14b"
+# base_url = "http://localhost:11434"
+# max_steps = 25
+# tools = ["list_dir", "read_file", "grep", "write_file", "edit_file", "run_pytest"]
+# [agents.executor_14b.options]
+# num_ctx = 12288
+# temperature = 0.2
+#
+# Cualquier endpoint compatible con OpenAI (llama.cpp `llama-server`, vLLM, etc.):
+#
+# [agents.executor_server]
+# provider = "openai_compat"            # o "llamacpp" / "vllm" (solo etiquetas)
+# model = "nombre-del-modelo"            # el que acepte el servidor
+# base_url = "http://localhost:8080/v1"  # llama.cpp: 8080; vLLM: 8000
+# api_key_env = "MI_SERVIDOR_API_KEY"    # opcional
+# max_steps = 25
+# tools = ["list_dir", "read_file", "grep", "write_file", "edit_file", "run_pytest"]

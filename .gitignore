@@ -41,3 +41,4 @@ runs/
 
 # Trabajos para entregar (no se versionan)
 entregas/
+.agent_runs/

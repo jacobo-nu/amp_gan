@@ -8,6 +8,8 @@ Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](
 - [x] Fase 3, GAN condicional por hidrofobicidad: hecha en `feat/conditional-hydrophobicity` (criterio A cumplido con el A.2 revisado tras el resultado, B no cumplido; ver roadmap). Pendiente de fusionar con `main`
 - [ ] Fase 3, GAN condicional por longitud e hidrofobicidad a la vez (percentiles 10–90)
 - [ ] Notebook nuevo: la condicional por ambas y la comparación final de variantes (los notebooks 03 WGAN-GP, 04 longitud y 05 hidrofobicidad ya están hechos, uno por experimento)
+- [x] Agente ejecutor con modelo local hecho en `feat/local-agent` (`src/amp_agents/`; ver roadmap). Pendiente de fusionar con `main`
+- [ ] Integrar por rol los modelos locales descargados (`llama3.2:3b`, `phi4-mini`, `gemma3:4b`, `qwen2.5-coder:7b`, `nomic-embed-text`) en `agents.toml` y repetir la prueba en vivo con cada uno; repetir `qwen2.5:14b` ya no es posible (modelo borrado)
 
 ## Siguiente (Fase 1 — Datos)
 - [ ] Escribir el script de descarga reproducible en `src/amp_gan/`
