@@ -41,6 +41,19 @@ con el GRAVY como propiedad principal: ``hydrophobicity_mean`` y
 cadena vacía no tiene GRAVY; las no válidas por longitud sí cuentan), la tasa de
 acierto usa TODAS (una cadena vacía es un fallo) y las W1 secundarias son las de
 longitud y carga neta, frente a los datos reales con GRAVY en ``[t - tol, t + tol]``.
+
+Criterio A.2 (error frente a la referencia sin condición)
+---------------------------------------------------------
+Un umbral fijo sobre el error absoluto medio no distingue control de dispersión
+natural: aunque la media generada fuese exacta, el error medio sería ≈ 0,8 veces la
+desviación típica generada. Por eso el criterio A.2 compara el error del modelo con el
+de la referencia sin condición en cada objetivo (:func:`mae_vs_reference`): se cumple
+si el error del modelo es MENOR que el de la referencia en TODOS los objetivos. La
+función sigue calculando, si se le pide, el criterio inicial (error medio ≤ umbral)
+para poder mostrarlo. Como magnitudes descriptivas (no criterio),
+:func:`target_dispersion_table` da la media, la desviación típica y el sesgo
+``|media generada - t|`` por objetivo. Sirven igual para ``length`` e
+``hydrophobicity`` (y para el experimento con ambas condiciones, una propiedad cada vez).
 """
 
 from __future__ import annotations
@@ -445,3 +458,82 @@ def real_ceiling(
     reales; ``tol`` por defecto es el de la longitud (pasar :data:`HYDRO_HIT_TOLERANCE` para el GRAVY).
     """
     return pd.DataFrame({"target": list(targets), "hit_rate": [hit_rate(real_values, t, tol) for t in targets]})
+
+
+# --------------------------------------------------------------------------- #
+# Criterio A.2 (error frente a la referencia) y magnitudes descriptivas
+# --------------------------------------------------------------------------- #
+def _indexed_by_target(table: pd.DataFrame | pd.Series, column: str) -> pd.Series:
+    """Serie ``column`` indexada por objetivo (acepta ``target`` como columna o como índice)."""
+    if isinstance(table, pd.Series):
+        return table.astype("float64").sort_index()
+    if "target" in table.columns:
+        table = table.set_index("target")
+    return table[column].astype("float64").sort_index()
+
+
+def mae_vs_reference(
+    table: pd.DataFrame,
+    reference: pd.DataFrame | pd.Series,
+    prop: str = "hydrophobicity",
+    initial_max: float | None = None,
+) -> dict:
+    """Criterio A.2: el error absoluto medio del modelo es menor que el de la referencia en cada objetivo.
+
+    Args:
+        table: evaluación por objetivos del modelo (una fila por objetivo; ``target`` como
+            columna o como índice) con la columna ``{prop}_mae``.
+        reference: error de la referencia sin condición por objetivo: un ``DataFrame`` como el de
+            :func:`unconditional_target_table` (columna ``{prop}_mae``) o una ``Series`` indexada
+            por objetivo. Debe tener los mismos objetivos que ``table`` (se emparejan con una
+            tolerancia de ``1e-6``; ``ValueError`` si falta alguno).
+        prop: ``"length"`` o ``"hydrophobicity"``.
+        initial_max: si se da, umbral del criterio INICIAL (error medio de los objetivos ``<= initial_max``),
+            que se calcula solo para mostrarlo (no interviene en ``ok``).
+
+    Returns:
+        Diccionario con ``per_target`` (``DataFrame`` indexado por objetivo con ``model_mae``,
+        ``reference_mae`` y ``beats``), ``n_beaten``, ``n_targets``, ``ok`` (``True`` solo si el modelo
+        gana en todos; una comparación con ``NaN`` cuenta como no ganada), ``mean_model_mae``,
+        ``mean_reference_mae``, ``initial_max`` e ``initial_ok`` (``None`` si no se dio umbral).
+    """
+    column = f"{check_target_property(prop)}_mae"
+    model = _indexed_by_target(table, column)
+    ref = _indexed_by_target(reference, column)
+    if model.empty:
+        raise ValueError("La tabla del modelo no tiene objetivos.")
+    ref = ref.reindex(model.index, method="nearest", tolerance=1e-6)
+    if ref.isna().any():
+        raise ValueError("La referencia no tiene los mismos objetivos que la tabla del modelo.")
+    beats = (model < ref).astype(bool)
+    mean_model = float(model.mean())
+    return {
+        "per_target": pd.DataFrame({"model_mae": model, "reference_mae": ref, "beats": beats}),
+        "n_beaten": int(beats.sum()),
+        "n_targets": int(len(model)),
+        "ok": bool(beats.all()),
+        "mean_model_mae": mean_model,
+        "mean_reference_mae": float(ref.mean()),
+        "initial_max": initial_max,
+        "initial_ok": None if initial_max is None else bool(mean_model <= initial_max),
+    }
+
+
+def target_dispersion_table(
+    target_sequences: dict[float, Sequence[str]], targets: Sequence[float], prop: str = "hydrophobicity"
+) -> pd.DataFrame:
+    """Magnitudes descriptivas por objetivo (no son criterio): media, desviación típica y sesgo generados.
+
+    ``target_sequences[t]`` son las secuencias pedidas con ``prop = t``. Columnas (índice ``target``):
+    ``mean`` (media de la propiedad generada), ``std`` (desviación típica muestral, ``ddof=1``) y
+    ``bias`` = ``|mean - t|``. Igual que en :func:`evaluate_target`, con el GRAVY las cadenas vacías
+    (sin GRAVY) quedan fuera; ``NaN`` si no queda ninguna. El sesgo medio del conjunto es ``table["bias"].mean()``.
+    """
+    rows = []
+    for t in targets:
+        values = property_values(target_sequences[target_key(prop, t)], prop)
+        values = values[~np.isnan(values)]
+        mean = float(values.mean()) if values.size else float("nan")
+        std = float(values.std(ddof=1)) if values.size > 1 else float("nan")
+        rows.append({"target": target_key(prop, t), "mean": mean, "std": std, "bias": abs(mean - t)})
+    return pd.DataFrame(rows).set_index("target")

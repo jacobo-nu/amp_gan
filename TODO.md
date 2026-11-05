@@ -5,9 +5,9 @@ Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](
 ## Ahora
 - [x] Fase 3, WGAN-GP: hecha en `feat/wgan-gp` (4 de 5 condiciones frente a la referencia; ver roadmap). Pendiente de fusionar con `main`
 - [x] Fase 3, GAN condicional por longitud: hecha en `feat/conditional-gan` (criterios A y B cumplidos; ver roadmap). Pendiente de fusionar con `main`
-- [x] Fase 3, GAN condicional por hidrofobicidad: hecha en `feat/conditional-hydrophobicity` (criterios A y B no cumplidos; ver roadmap). Pendiente de fusionar con `main`
+- [x] Fase 3, GAN condicional por hidrofobicidad: hecha en `feat/conditional-hydrophobicity` (criterio A cumplido con el A.2 revisado tras el resultado, B no cumplido; ver roadmap). Pendiente de fusionar con `main`
 - [ ] Fase 3, GAN condicional por longitud e hidrofobicidad a la vez (percentiles 10–90)
-- [ ] Notebook 03: añadir la sección de la condicional por ambas y la comparación final de variantes (secciones a, b y c ya hechas)
+- [ ] Notebook nuevo: la condicional por ambas y la comparación final de variantes (los notebooks 03 WGAN-GP, 04 longitud y 05 hidrofobicidad ya están hechos, uno por experimento)
 
 ## Siguiente (Fase 1 — Datos)
 - [ ] Escribir el script de descarga reproducible en `src/amp_gan/`

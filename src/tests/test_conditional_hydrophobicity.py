@@ -30,6 +30,7 @@ from amp_gan.conditions import (
     evaluate_target,
     hit_rate,
     length_control_slope,
+    mae_vs_reference,
     property_values,
     raw_conditions_from_sequences,
     real_ceiling,
@@ -37,6 +38,7 @@ from amp_gan.conditions import (
     target_columns,
     target_key,
     target_label,
+    target_dispersion_table,
     target_lengths,
     target_values,
     unconditional_target_table,
@@ -194,6 +196,127 @@ def test_real_subset_around_gravy_uses_the_tolerance():
     assert HYDROPHOBIC not in near and HYDROPHILIC not in near and NEUTRAL in near and "A" not in near
     assert real_subset_around(seqs, 1.8, 0.0, prop="hydrophobicity") == ["A"]
     assert real_subset_around(["AAAAA", "A" * 9], 8, prop="length") == ["A" * 9]  # por defecto +-2 aa
+
+
+# --------------------------------------------------------------------------- #
+# Criterio A.2 (error frente a la referencia) y magnitudes descriptivas
+# --------------------------------------------------------------------------- #
+_T5 = (-1.465, -0.73, -0.3075, 0.144, 0.88)
+_REF_MAE = (1.291, 0.786, 0.669, 0.742, 1.214)
+
+
+def _model_table(maes, targets=_T5):
+    return pd.DataFrame({"target": list(targets), "hydrophobicity_mae": list(maes), "hit_rate": 0.3})
+
+
+def test_mae_vs_reference_passes_when_the_model_beats_the_reference_everywhere():
+    res = mae_vs_reference(_model_table((0.554, 0.556, 0.549, 0.545, 0.582)), pd.Series(_REF_MAE, index=_T5),
+                           "hydrophobicity", initial_max=0.30)
+    assert res["ok"] and res["n_beaten"] == 5 and res["n_targets"] == 5
+    assert res["per_target"]["beats"].all()
+    assert list(res["per_target"].columns) == ["model_mae", "reference_mae", "beats"]
+    assert res["per_target"]["reference_mae"].tolist() == list(_REF_MAE)
+    assert res["mean_model_mae"] == pytest.approx(0.5572) and res["mean_reference_mae"] == pytest.approx(0.9404)
+    # El criterio inicial (<= 0,30) se sigue calculando y no se cumple: no condiciona a ``ok``.
+    assert res["initial_max"] == 0.30 and res["initial_ok"] is False
+
+
+def test_mae_vs_reference_fails_if_one_target_is_not_beaten():
+    maes = [0.554, 0.556, 0.549, 0.80, 0.582]  # el cuarto objetivo (ref. 0,742) no mejora
+    res = mae_vs_reference(_model_table(maes), pd.DataFrame({"target": _T5, "hydrophobicity_mae": _REF_MAE}))
+    assert not res["ok"] and res["n_beaten"] == 4
+    assert res["per_target"]["beats"].tolist() == [True, True, True, False, True]
+    assert res["initial_ok"] is None and res["initial_max"] is None  # sin umbral, no hay criterio inicial
+    # Un empate exacto tampoco cumple (se exige «menor que»), y un NaN cuenta como no ganado.
+    tie = mae_vs_reference(_model_table([0.5, 0.5, 0.669, 0.5, 0.5]), pd.Series(_REF_MAE, index=_T5))
+    assert tie["n_beaten"] == 4 and not tie["ok"]
+    nan = mae_vs_reference(_model_table([0.5, float("nan"), 0.5, 0.5, 0.5]), pd.Series(_REF_MAE, index=_T5))
+    assert nan["n_beaten"] == 4 and not nan["ok"]
+
+
+def test_initial_criterion_is_computed_independently_of_the_revised_one():
+    low = _model_table([0.2, 0.3, 0.25, 0.28, 0.3])
+    res = mae_vs_reference(low, pd.Series(_REF_MAE, index=_T5), initial_max=0.30)
+    assert res["initial_ok"] is True and res["ok"]
+    # Cumple el inicial en promedio pero no mejora a la referencia en un objetivo: A.2 revisado no se cumple.
+    res = mae_vs_reference(_model_table([0.04, 0.04, 0.04, 0.04, 1.3]), pd.Series(_REF_MAE, index=_T5), initial_max=0.30)
+    assert res["initial_ok"] is True and not res["ok"] and res["n_beaten"] == 4
+
+
+def test_mae_vs_reference_accepts_index_or_column_and_the_unconditional_table():
+    sample = [HYDROPHOBIC] * 6 + [HYDROPHILIC] * 2 + [NEUTRAL] * 2
+    ref = unconditional_target_table(sample, (4.5, -0.6), prop="hydrophobicity")
+    model = pd.DataFrame({"hydrophobicity_mae": [0.1, 0.2]}, index=pd.Index([-0.6, 4.5], name="target"))  # desordenado
+    res = mae_vs_reference(model, ref, "hydrophobicity")
+    assert res["ok"] and res["per_target"].index.tolist() == [-0.6, 4.5]
+    assert res["per_target"]["reference_mae"].tolist() == pytest.approx(ref.set_index("target").loc[[-0.6, 4.5], "hydrophobicity_mae"])
+    # Objetivos que no están en la referencia: error, no una comparación silenciosa.
+    with pytest.raises(ValueError, match="mismos objetivos"):
+        mae_vs_reference(_model_table((0.1, 0.1), (4.5, 1.0)), ref)
+
+
+def test_mae_vs_reference_works_for_length_too():
+    ref = pd.DataFrame({"target": [9, 20, 40], "length_mae": [6.0, 4.0, 22.0]})
+    good = pd.DataFrame({"target": [9, 20, 40], "length_mae": [1.5, 1.0, 9.0]})
+    res = mae_vs_reference(good, ref, "length", initial_max=3.0)
+    assert res["ok"] and res["n_beaten"] == 3 and res["initial_ok"] is False  # media 3,83 > 3
+    assert not mae_vs_reference(good.assign(length_mae=[1.5, 5.0, 9.0]), ref, "length")["ok"]
+    with pytest.raises(ValueError, match="Propiedad objetivo"):
+        mae_vs_reference(good, ref, "carga")
+
+
+def test_target_dispersion_table_gives_mean_std_and_bias():
+    tseqs = {
+        4.5: [HYDROPHOBIC, HYDROPHOBIC, "", HYDROPHILIC],  # la vacía no cuenta: media (4,5 + 4,5 - 4,5) / 3 = 1,5
+        -0.6: [NEUTRAL, NEUTRAL, NEUTRAL],  # media exacta y sin dispersión
+        0.0: [NEUTRAL],  # una sola secuencia: la desviación típica muestral no está definida
+        1.0: ["", ""],  # todas vacías
+    }
+    table = target_dispersion_table(tseqs, (4.5, -0.6, 0.0, 1.0), "hydrophobicity")
+    assert list(table.columns) == ["mean", "std", "bias"] and table.index.tolist() == [4.5, -0.6, 0.0, 1.0]
+    assert table.loc[4.5, "mean"] == pytest.approx(1.5)
+    assert table.loc[4.5, "std"] == pytest.approx(np.std([4.5, 4.5, -4.5], ddof=1))
+    assert table.loc[4.5, "bias"] == pytest.approx(3.0)
+    assert table.loc[-0.6, "std"] == pytest.approx(0.0, abs=1e-12) and table.loc[-0.6, "bias"] == pytest.approx(0.0, abs=1e-12)
+    assert table.loc[0.0, "bias"] == pytest.approx(0.6) and np.isnan(table.loc[0.0, "std"])
+    assert table.loc[1.0].isna().all()
+    # Con la longitud las cadenas vacías cuentan con longitud 0 (como en la evaluación por objetivos).
+    lens = target_dispersion_table({10: ["A" * 8, "A" * 12, ""]}, (10,), "length")
+    assert lens.loc[10, "mean"] == pytest.approx(20 / 3) and lens.loc[10, "bias"] == pytest.approx(10 - 20 / 3)
+
+
+def test_dispersion_explains_why_a_fixed_error_threshold_is_unreachable():
+    """Con la media exacta, el error medio es ~0,8 veces la desviación típica (no ~0): el umbral fijo era inalcanzable."""
+    rng = np.random.default_rng(0)
+    values = rng.normal(loc=-0.3, scale=0.7, size=20000)
+    mae_with_exact_mean = float(np.abs(values - values.mean()).mean())
+    assert mae_with_exact_mean == pytest.approx(0.7 * np.sqrt(2 / np.pi), rel=0.02)  # ~0,56
+    assert mae_with_exact_mean > 0.30
+
+
+def test_saved_hydro_results_satisfy_the_revised_a2_if_available():
+    """Con los resultados guardados de ``cgan_hydro`` (época 200, sample): criterio revisado cumplido; inicial no."""
+    fasta = _PROCESSED / "cgan_hydro_generated_targets_sample.fasta"
+    targets_csv = _PROCESSED / "cgan_hydro_targets.csv"
+    info_json = _PROCESSED / "cgan_hydro_run_info.json"
+    if not (fasta.exists() and targets_csv.exists() and info_json.exists()):
+        pytest.skip("faltan los resultados de cgan_hydro")
+    saved = pd.read_csv(targets_csv)
+    saved = saved[(saved["epoch"] == saved["epoch"].max()) & (saved["mode"] == "sample")].set_index("target").sort_index()
+    info = json.loads(info_json.read_text(encoding="utf-8"))
+    ref = pd.DataFrame(info["unconditional_references"]["gan_stabc"])
+    res = mae_vs_reference(saved, ref, "hydrophobicity", initial_max=0.30)
+    assert res["ok"] and res["n_beaten"] == 5
+    assert res["mean_model_mae"] == pytest.approx(0.558, abs=5e-4) and res["initial_ok"] is False
+    assert res["per_target"]["model_mae"].tolist() == pytest.approx([0.554, 0.556, 0.549, 0.545, 0.582], abs=6e-4)
+    targets = saved.index.tolist()
+    gen = read_fasta(fasta)
+    tseqs = {t: gen[gen["id"].str.startswith(f"gen_{target_label('hydrophobicity', t)}_")]["sequence"].tolist() for t in targets}
+    disp = target_dispersion_table(tseqs, targets, "hydrophobicity")
+    assert disp["bias"].mean() == pytest.approx(0.124, abs=1e-3)
+    assert disp["std"].between(0.6, 0.8).all()
+    # La media de los objetivos coincide con la guardada.
+    assert disp["mean"].tolist() == pytest.approx(saved["hydrophobicity_mean"].tolist(), abs=1e-6)
 
 
 # --------------------------------------------------------------------------- #
