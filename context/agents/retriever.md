@@ -17,4 +17,4 @@ Lista de `{"ruta", "linea", "puntuacion", "texto"}` ordenada por puntuación.
 
 ## Límites
 - No resume, no responde, no interpreta: solo recupera fragmentos.
-- Debe compararse siempre con una búsqueda léxica sencilla (TF-IDF o similar); si no la mejora, se documenta.
+- Se comparó con una búsqueda léxica BM25 (k1 = 1,5, b = 0,75): los embeddings de `nomic-embed-text` dieron un 60 % de acierto en el top-3 frente al 73 % de BM25, así que **BM25 es el recuperador por defecto** (`search_backend = "lexical"`) y los embeddings son una opción explícita (`search_backend = "embedding"`, `--embedding` en la línea de órdenes). Un modelo de embeddings mejor para castellano (`bge-m3`) queda sin probar a falta de permiso para descargarlo.

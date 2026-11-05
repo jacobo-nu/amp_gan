@@ -4,6 +4,7 @@ Uso (desde la carpeta ``src``, con Ollama en marcha y los modelos descargados)::
 
     python -m amp_agents.eval_roles locator       --workdir /ruta/a/carpeta/vacia   # RETIRADO: solo para reproducir el resultado
     python -m amp_agents.eval_roles doc_checker   --workdir ...
+    python -m amp_agents.eval_roles doc_checker_ss --workdir ...   # variante de una pasada de doc_checker (mismo protocolo y criterios)
     python -m amp_agents.eval_roles code_reviewer --workdir ...
     python -m amp_agents.eval_roles summarizer    --workdir ...
     python -m amp_agents.eval_roles retriever     --workdir ...
@@ -21,12 +22,17 @@ PROTOCOLO Y CRITERIOS (fijados de antemano; no se ajustan tras ver los resultado
 - locator (``llama3.2:3b``): 10 preguntas con verdad calculada por código (5 definiciones con ``ast``, 3 importaciones
   y 2 constantes con expresiones regulares), 2 repeticiones. Éxito de una respuesta: el conjunto de pares
   (ruta, línea) es EXACTAMENTE el esperado y cada línea citada existe. Criterio: >= 80 % de respuestas exactas.
-- doc_checker (``phi4-mini``): copias de ``context/constitution/roadmap.md`` y ``TODO.md`` (esta como
-  ``context/TODO.md``, porque el rol solo lee ``context/`` y ``src/``) con 6 incoherencias sembradas de tipos
+- doc_checker (``phi4-mini``): copias CONGELADAS de ``context/constitution/roadmap.md`` y ``TODO.md`` (esta como
+  ``context/TODO.md``, porque el rol solo lee ``context/`` y ``src/``) tal como estaban en la evaluación original
+  (``amp_agents/fixtures/``, para que los documentos vivos del repositorio puedan cambiar sin alterar el caso evaluado)
+  con 6 incoherencias sembradas de tipos
   distintos, más una copia limpia, 3 repeticiones. Una incoherencia sembrada se recupera si alguna de las dos citas
   de un hallazgo es literal y cae (como mucho 2 líneas) sobre la línea alterada. Criterios: >= 90 % de citas
   literales válidas (todas las ejecuciones); >= 4 de las 6 sembradas recuperadas de media por repetición; <= 2
   falsos positivos (hallazgos en la copia limpia) en CADA repetición.
+- doc_checker_ss (``phi4-mini``, modo ``single_shot``): el mismo protocolo, los mismos documentos congelados y LOS MISMOS
+  criterios (se leen de la entrada ``doc_checker`` de ``CRITERIA``); solo cambia que no hay herramientas y los dos
+  documentos, con numeración de línea, van en el mensaje. Sus resultados se guardan con su propio nombre de rol.
 - code_reviewer (``qwen2.5-coder:7b``): copia de ``src/amp_gan/properties.py`` con 5 defectos sembrados de tipos
   distintos, más la copia limpia, 3 repeticiones. Un hallazgo cuenta si su línea está a +-2 de la sembrada.
   Criterios: >= 3 de 5 recuperados de media; >= 90 % de citas válidas (existe la línea y la cita es literal);
@@ -51,6 +57,7 @@ modelo se pasó parcialmente a la CPU.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import shutil
 import subprocess
@@ -88,8 +95,14 @@ from .verifiers import (
 ROLES = ("doc_checker", "code_reviewer", "summarizer", "retriever")
 RETIRED_ROLES = ("locator",)
 ALL_ROLES = ("locator", *ROLES)
+# Variantes de un rol: se evalúan con el protocolo y los criterios de su rol base, pero con su propio nombre en los
+# ficheros de resultados. No entran en ``all`` (se piden expresamente, para comparar con el rol base).
+VARIANT_ROLES = {"doc_checker_ss": "doc_checker"}
+COMMAND_ROLES = (*ALL_ROLES, *VARIANT_ROLES)
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 DEFAULT_WORKDIR = Path(tempfile.gettempdir()) / "amp_roles_eval"
 EXCLUDED_FROM_COPY = ("src/amp_agents/eval_roles.py",)  # y src/tests/test_agents_eval*.py
+EXCLUDED_DIRS_FROM_COPY = ("src/amp_agents/fixtures",)  # los documentos congelados no deben estar en el material consultado
 
 CRITERIA = {
     "locator": {"exact_rate_min": 0.80},
@@ -101,6 +114,11 @@ CRITERIA = {
 REPS = {"locator": 2, "doc_checker": 3, "code_reviewer": 3, "summarizer": 3}
 
 
+def base_role(role: str) -> str:
+    """Rol cuyo protocolo y criterios (``CRITERIA``, ``REPS``) usa ``role``: él mismo, o su rol base si es una variante."""
+    return VARIANT_ROLES.get(role, role)
+
+
 # -- copias ------------------------------------------------------------------------------------------------
 def make_copy(destination: Path, source: Path = PROJECT_ROOT) -> Path:
     """Copia ``src/`` y ``context/`` (sin ``context/data/``) y quita de la copia este script y sus tests."""
@@ -109,6 +127,8 @@ def make_copy(destination: Path, source: Path = PROJECT_ROOT) -> Path:
         target = destination / rel
         if target.exists():
             target.unlink()
+    for rel in EXCLUDED_DIRS_FROM_COPY:
+        shutil.rmtree(destination / rel, ignore_errors=True)
     for test in (destination / "src" / "tests").glob("test_agents_eval*.py"):
         test.unlink()
     return destination
@@ -473,28 +493,49 @@ def match_doc_findings(citations: list[dict], seeds: list[dict], max_span: int =
 DOC_NOTE = "cifras, fechas, nombres de fichero y estados hecho/pendiente de una misma tarea"
 
 
-def eval_doc_checker(args, rec: Recorder, work: Path, results: Path) -> dict:
-    real = PROJECT_ROOT
-    roadmap_text = (real / "context/constitution/roadmap.md").read_text(encoding="utf-8")
-    todo_text = (real / "TODO.md").read_text(encoding="utf-8")
+def frozen_docs() -> tuple[str, str]:
+    """``(roadmap, TODO)`` CONGELADOS, tal como estaban al hacer la evaluación original (commit 4a98ff2).
+
+    Los documentos vivos del repositorio cambian con el trabajo; el caso evaluado (y con él las siembras y los criterios)
+    no debe cambiar, así que la evaluación y sus tests leen estas copias de ``amp_agents/fixtures/``.
+    """
+    return (
+        (FIXTURES_DIR / "roadmap.md").read_text(encoding="utf-8"),
+        (FIXTURES_DIR / "TODO.md").read_text(encoding="utf-8"),
+    )
+
+
+def eval_doc_checker(args, rec: Recorder, work: Path, results: Path, role: str = "doc_checker") -> dict:
+    """Evalúa ``doc_checker`` o una variante suya (``doc_checker_ss``) con el mismo protocolo y los mismos criterios.
+
+    ``role`` solo cambia el rol que se ejecuta y los nombres de carpetas, registros y ficheros de siembra; las
+    repeticiones y los umbrales salen siempre de la entrada ``doc_checker`` de ``REPS`` y ``CRITERIA``. Con ``--limit N``
+    solo se ejecutan los N primeros casos de cada repetición (``seeded``, ``clean``).
+    """
+    roadmap_text, todo_text = frozen_docs()
     seeded_roadmap, seeded_todo, seeds = seed_documents(roadmap_text, todo_text)
+    names = ("seeded", "clean")[: args.limit] if args.limit else ("seeded", "clean")
     copies = {}
     for name, (road, todo) in {"seeded": (seeded_roadmap, seeded_todo), "clean": (roadmap_text, todo_text)}.items():
-        root = make_copy(work / f"doc_checker_{name}")
+        if name not in names:
+            continue
+        root = make_copy(work / f"{role}_{name}")
         (root / ROADMAP_REL).write_text(road, encoding="utf-8")
         (root / TODO_REL).write_text(todo, encoding="utf-8")
         copies[name] = root
-    (results / "seeds_doc_checker.json").write_text(json.dumps(seeds, ensure_ascii=False, indent=1), encoding="utf-8")
-    reps = args.reps or REPS["doc_checker"]
+    (results / f"seeds_{role}.json").write_text(json.dumps(seeds, ensure_ascii=False, indent=1), encoding="utf-8")
+    reps = args.reps or REPS[base_role(role)]
+    criteria = CRITERIA[base_role(role)]
+    verifier = get_agent_config(role).verifier or "doc_checker"
     per_rep: list[dict] = []
     for rep in range(1, reps + 1):
         entry = {"rep": rep}
-        for name in ("seeded", "clean"):
+        for name in names:
             root = copies[name]
-            task, context = prepare_task("doc_checker", [ROADMAP_REL, TODO_REL], root, DOC_NOTE)
+            task, context = prepare_task(role, [ROADMAP_REL, TODO_REL], root, DOC_NOTE)
             before = snapshot(root)
-            result = run_task("doc_checker", task, root=root, log_dir=results / "logs", run_label=f"doc_checker_{name}_{rep}_v{args.env_variant}", env_variant=args.env_variant)
-            verification = verify("doc_checker", result.report, root=root) if result.stop_reason == "final" else None
+            result = run_task(role, task, root=root, log_dir=results / "logs", run_label=f"{role}_{name}_{rep}_v{args.env_variant}", env_variant=args.env_variant)
+            verification = verify(verifier, result.report, root=root) if result.stop_reason == "final" else None
             citations = verification.details.get("citations", []) if verification else []
             obj, _, _ = parse_json_output(result.report) if result.report else (None, False, None)
             n_findings = len(obj.get("incoherencias", [])) if isinstance(obj, dict) and isinstance(obj.get("incoherencias"), list) else 0
@@ -505,14 +546,14 @@ def eval_doc_checker(args, rec: Recorder, work: Path, results: Path) -> dict:
                 notes = f"hallazgos={n_findings} recuperadas={len(match['recovered'])}/6 {match['recovered']} laxo={len(match['recovered_lenient'])} falsos_positivos={len(match['false_positives'])}"
             else:
                 match = {"recovered": [], "recovered_lenient": [], "false_positives": list(range(n_findings))}
-                ok = valid_output and n_findings <= CRITERIA["doc_checker"]["false_positives_max"]
+                ok = valid_output and n_findings <= criteria["false_positives_max"]
                 notes = f"hallazgos_en_copia_limpia={n_findings}"
             if verification and verification.errors:
                 notes += f" errores={verification.errors[:2]}"
             if not verification:
                 notes += f" sin salida utilizable (parada {result.stop_reason})"
             details = {"copy": name, "match": match, "n_findings": n_findings, "citations": citations, "valid_output": valid_output}
-            record = _system_record("doc_checker", name, rep, result, root, before, args.env_variant, ok, notes, details, verification)
+            record = _system_record(role, name, rep, result, root, before, args.env_variant, ok, notes, details, verification)
             rec.add(record)
             entry[name] = {"recovered": len(match["recovered"]), "false_positives": len(match["false_positives"]) if name == "clean" else None, "findings": n_findings, "valid_output": valid_output}
         per_rep.append(entry)
@@ -531,8 +572,8 @@ def _citation_stats(runs: list[RunRecord]) -> tuple[int, int]:
 def _doc_summary(runs: list[RunRecord], per_rep: list[dict]) -> dict:
     valid, total = _citation_stats(runs)
     rate = valid / total if total else 0.0
-    recovered = [e["seeded"]["recovered"] for e in per_rep]
-    fps = [e["clean"]["false_positives"] for e in per_rep]
+    recovered = [e["seeded"]["recovered"] for e in per_rep if "seeded" in e]
+    fps = [e["clean"]["false_positives"] for e in per_rep if "clean" in e]
     mean_rec = sum(recovered) / len(recovered) if recovered else 0.0
     c = CRITERIA["doc_checker"]
     return {
@@ -941,6 +982,7 @@ def criteria_table(role: str, model: str, criteria: list) -> str:
 EVALUATORS = {
     "locator": eval_locator,
     "doc_checker": eval_doc_checker,
+    "doc_checker_ss": functools.partial(eval_doc_checker, role="doc_checker_ss"),
     "code_reviewer": eval_code_reviewer,
     "summarizer": eval_summarizer,
     "retriever": eval_retriever,
@@ -977,7 +1019,7 @@ def evaluate_role(role: str, args) -> dict:
         "elapsed_s": round(elapsed, 1),
         "ollama_ps_after": ollama_ps_text(),
         "ollama_stop": stop_note,
-        "protocol": CRITERIA[role],
+        "protocol": CRITERIA[base_role(role)],
         **summary,
         "runs": [asdict(r) for r in rec.runs],
     }
@@ -1003,7 +1045,7 @@ def build_report(results_dir: Path) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m amp_agents.eval_roles", description="Evaluación en vivo de los roles (no es un test de pytest).")
-    parser.add_argument("command", choices=[*ALL_ROLES, "all", "report"])
+    parser.add_argument("command", choices=[*COMMAND_ROLES, "all", "report"])
     parser.add_argument("--workdir", default=str(DEFAULT_WORKDIR), help="carpeta (fuera del repositorio) para las copias")
     parser.add_argument("--results-dir", dest="results_dir", help="carpeta de resultados (por defecto <workdir>/results)")
     parser.add_argument("--env-variant", dest="env_variant", type=int, default=1, help="variante de la sección «Entorno de ejecución» del prompt")
@@ -1025,9 +1067,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     started = time.monotonic()
     requested = [r.strip() for r in args.roles.split(",") if r.strip()]
-    unknown = [r for r in requested if r not in ALL_ROLES]
+    unknown = [r for r in requested if r not in COMMAND_ROLES]
     if unknown:
-        parser.error(f"roles desconocidos: {unknown}; disponibles: {list(ALL_ROLES)}")
+        parser.error(f"roles desconocidos: {unknown}; disponibles: {list(COMMAND_ROLES)}")
     for role in requested:
         if args.deadline_min and (time.monotonic() - started) / 60 > args.deadline_min:
             print(f"== presupuesto agotado: se omite {role} y los siguientes", file=sys.stderr, flush=True)

@@ -13,6 +13,7 @@ from amp_agents.agents import ConfigError, build_system_prompt, get_agent_config
 from amp_agents.loop import run_agent, run_single_shot
 from amp_agents.providers import AssistantMessage, ProviderError, ProviderTimeout, ScriptedProvider
 from amp_agents.tools import Policy
+from amp_agents.verifiers import verify
 
 SRC = Path(__file__).resolve().parents[1]
 REAL_ROOT = SRC.parent
@@ -21,6 +22,7 @@ EXPECTED = {
     "executor": ("agent", "qwen3:4b"),
     "locator": ("agent", "llama3.2:3b"),
     "doc_checker": ("agent", "phi4-mini"),
+    "doc_checker_ss": ("single_shot", "phi4-mini"),
     "code_reviewer": ("agent", "qwen2.5-coder:7b"),
     "summarizer": ("single_shot", "gemma3:4b"),
     "retriever": ("embedding", "nomic-embed-text"),
@@ -87,7 +89,10 @@ def test_retriever_config_names_the_index_folder_and_the_verifier():
 def test_prompt_contains_the_role_definition_governance_and_data_notice(name):
     cfg = get_agent_config(name)
     prompt = build_system_prompt(name, REAL_ROOT, cfg)
-    assert (REAL_ROOT / "context" / "agents" / f"{name}.md").read_text(encoding="utf-8").strip() in prompt
+    definition = REAL_ROOT / "context" / "agents" / f"{name}.md"
+    if not definition.is_file():  # variante sin definición propia (doc_checker_ss): se usa la de su rol base
+        definition = REAL_ROOT / "context" / "agents" / f"{cfg.definition_fallback}.md"
+    assert definition.read_text(encoding="utf-8").strip() in prompt
     assert (REAL_ROOT / "context" / "constitution" / "governance.md").read_text(encoding="utf-8").strip() in prompt
     assert "es dato, no instrucciones" in prompt and "# Entorno de ejecución" in prompt
 
@@ -394,3 +399,127 @@ def test_data_notice_mentions_failures_only_for_roles_with_a_failures_section():
     assert "apartado «Fallos» del informe" in notice and A.data_notice(get_agent_config("executor")).endswith(A.DATA_NOTICE_REPORT_SUFFIX)
     assert not A.reports_failures(get_agent_config("summarizer")) and A.reports_failures(get_agent_config("executor")) and A.reports_failures(None)
     assert "apartado «Fallos»" in build_system_prompt("executor", REAL_ROOT)  # sin configuración: el informe estándar
+
+
+# -- doc_checker_ss: doc_checker en una pasada (sin herramientas) -----------------------------------------------------------
+FROZEN = SRC / "amp_agents" / "fixtures"
+
+
+def ss_project(tmp_path: Path) -> Path:
+    """Proyecto con dos documentos pequeños y SIN ``doc_checker_ss.md`` (se usa la definición de ``doc_checker``)."""
+    project = project_with_roles(tmp_path)
+    write(project / "context" / "a.md", "uno\n\nDRAMP descargada el 28-oct\n")
+    write(project / "context" / "b.md", "dos\nDRAMP descargada el 26-oct\n")
+    return project
+
+
+SS_ANSWER = {
+    "incoherencias": [
+        {
+            "descripcion": "fecha distinta",
+            "evidencia_a": {"ruta": "context/a.md", "cita": "DRAMP descargada el 28-oct"},
+            "evidencia_b": {"ruta": "context/b.md", "cita": "DRAMP descargada el 26-oct"},
+        }
+    ]
+}
+
+
+def test_doc_checker_ss_config_is_a_new_role_that_leaves_doc_checker_intact():
+    ss, base = get_agent_config("doc_checker_ss"), get_agent_config("doc_checker")
+    assert (base.mode, base.tools, base.options["num_ctx"]) == ("agent", ["read_file", "grep", "list_dir"], 12288)  # intacto
+    assert ss.mode == "single_shot" and ss.tools == [] and ss.model == base.model == "phi4-mini"
+    assert ss.verifier == base.verifier == "doc_checker" and ss.definition_fallback == "doc_checker"
+    assert ss.timeout > 0 and ss.max_seconds > 0 and ss.max_tokens == base.max_tokens  # nunca sin límite de tiempo
+    assert A.effective_write_roots(ss) == []
+
+
+def test_doc_checker_ss_context_fits_the_frozen_documents_with_margin():
+    ss = get_agent_config("doc_checker_ss")
+    documents = sum(len((FROZEN / name).read_text(encoding="utf-8")) for name in ("roadmap.md", "TODO.md"))
+    system = len(build_system_prompt("doc_checker_ss", REAL_ROOT, ss))
+    # cota pesimista: 2,5 caracteres por token (el español con código y markdown suele dar ~3), más la salida y el aviso de formato
+    estimated = (documents + system) / 2.5 + ss.max_tokens + 300
+    assert ss.options["num_ctx"] <= 16384 and estimated <= ss.options["num_ctx"]
+
+
+def test_definition_falls_back_to_doc_checker_when_doc_checker_ss_md_is_missing(tmp_path):
+    project = ss_project(tmp_path)
+    ss = get_agent_config("doc_checker_ss")
+    prompt = build_system_prompt("doc_checker_ss", project, ss)
+    assert "# Agente: Verificador de coherencia documental" in prompt
+    own = project / "context" / "agents" / "doc_checker_ss.md"
+    write(own, "# Agente: Verificador de coherencia documental (una pasada)\n")
+    assert "(una pasada)" in build_system_prompt("doc_checker_ss", project, ss)  # si existe, manda la propia
+    own.unlink()
+    (project / "context" / "agents" / "doc_checker.md").unlink()
+    with pytest.raises(ConfigError, match="doc_checker.md"):
+        build_system_prompt("doc_checker_ss", project, ss)
+    with pytest.raises(ConfigError, match="doc_checker_ss.md"):  # sin la clave de reserva, el error nombra el fichero propio
+        build_system_prompt("doc_checker_ss", project, get_agent_config("doc_checker_ss", definition_fallback=""))
+
+
+def test_doc_checker_ss_environment_section_has_no_tools_and_asks_for_json():
+    prompt = build_system_prompt("doc_checker_ss", REAL_ROOT, get_agent_config("doc_checker_ss"))
+    environment = prompt.split("# Entorno de ejecución")[1]
+    assert "No tienes herramientas" in environment and "UN ÚNICO objeto JSON" in environment and "sin su número ni el tabulador" in environment
+    assert "coma decimal" not in environment and "Hecho / Verificado / Fallos / Pendiente" not in environment
+    assert "solo dispones de estas herramientas" not in environment
+    assert "Menciónalo en el apartado" not in prompt  # el aviso de datos no habla de «Fallos»
+
+
+def test_doc_checker_ss_task_embeds_both_documents_with_line_numbers(tmp_path):
+    project = ss_project(tmp_path)
+    task, context = R.prepare_task("doc_checker_ss", ["context/a.md", "context/b.md"], project, "fechas")
+    assert context == {} and "Aspecto a comprobar: fechas." in task and "`context/a.md`, `context/b.md`" in task
+    assert "### context/a.md\n```\n1\tuno\n2\t\n3\tDRAMP descargada el 28-oct\n```" in task
+    assert "### context/b.md\n```\n1\tdos\n2\tDRAMP descargada el 26-oct\n```" in task
+    with pytest.raises(ConfigError, match="al menos dos"):
+        R.prepare_task("doc_checker_ss", ["context/a.md"], project)
+    with pytest.raises(ConfigError, match="denegad|permit|fuera|no existe"):
+        R.prepare_task("doc_checker_ss", ["context/a.md", "context/falta.md"], project)
+    agent_task, _ = R.prepare_task("doc_checker", ["context/a.md", "context/b.md"], project)  # el rol con herramientas no cambia
+    assert "```" not in agent_task and "1\tuno" not in agent_task
+
+
+def test_doc_checker_ss_task_does_not_truncate_long_documents(tmp_path):
+    project = ss_project(tmp_path)
+    write(project / "context" / "larga.md", "\n".join(f"línea {i}" for i in range(1, 2001)) + "\n")
+    task, _ = R.prepare_task("doc_checker_ss", ["context/larga.md", "context/b.md"], project)
+    assert "2000\tlínea 2000" in task and "recortado" not in task
+
+
+def test_doc_checker_ss_single_request_without_tools_and_same_verifier(tmp_path):
+    project = ss_project(tmp_path)
+    provider = RecordingProvider([json.dumps(SS_ANSWER)])
+    task, _ = R.prepare_task("doc_checker_ss", ["context/a.md", "context/b.md"], project)
+    result = R.run_task("doc_checker_ss", task, root=project, log_dir=tmp_path / "logs", provider_instance=provider)
+    assert result.stop_reason == "final" and result.steps == 1 and result.tools_called == []
+    assert provider.tools_seen == [None] and len(provider.received) == 1
+    assert provider.timeouts == [get_agent_config("doc_checker_ss").max_seconds]
+    system, user = provider.received[0]
+    assert "# Agente: Verificador de coherencia documental" in system["content"] and "3\tDRAMP descargada el 28-oct" in user["content"]
+    check = verify("doc_checker", result.report, root=project)
+    assert check.valid and all(c["valid"] for c in check.details["citations"])
+    start = json.loads(result.log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert start["mode"] == "single_shot" and start["tools"] == [] and start["metadata"]["agent"] == "doc_checker_ss"
+
+
+def test_doc_checker_ss_invented_quotes_are_rejected_by_the_same_verifier(tmp_path):
+    project = ss_project(tmp_path)
+    invented = {"incoherencias": [{"descripcion": "d", "evidencia_a": {"ruta": "context/a.md", "cita": "3\tDRAMP descargada el 28-oct"}, "evidencia_b": {"ruta": "context/b.md", "cita": "esto no existe"}}]}
+    result = R.run_task("doc_checker_ss", "t", root=project, log_dir=False, provider_instance=ScriptedProvider([json.dumps(invented)]))
+    check = verify("doc_checker", result.report, root=project)
+    assert not check.valid and any("cita no literal" in e for e in check.errors)
+    assert [c["valid"] for c in check.details["citations"]] == [False, False]  # la numeración copiada con la cita tampoco vale
+    prose = R.run_task("doc_checker_ss", "t", root=project, log_dir=False, provider_instance=ScriptedProvider(["No encuentro incoherencias."]))
+    assert not verify("doc_checker", prose.report, root=project).valid
+
+
+def test_cli_doc_checker_ss_exits_0_with_valid_citations(tmp_path, monkeypatch, capsys):
+    project = ss_project(tmp_path)
+    scripted = ScriptedProvider([json.dumps(SS_ANSWER)])
+    monkeypatch.setattr(R, "make_provider", lambda config: scripted)
+    args = ["--agent", "doc_checker_ss", "context/a.md", "context/b.md", "--note", "fechas", "--root", str(project), "--log-dir", str(tmp_path / "l")]
+    assert R.main(args) == 0
+    assert "verificación: válida" in capsys.readouterr().err
+    assert "1\tuno" in scripted.received[0][1]["content"]

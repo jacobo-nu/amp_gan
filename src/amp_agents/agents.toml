@@ -80,6 +80,29 @@ verifier = "doc_checker"
 num_ctx = 12288
 temperature = 0.2
 
+# Variante de una pasada de doc_checker, para comparar con él (que queda intacto): mismo modelo, mismo formato JSON y
+# mismos verificadores de citas, pero sin herramientas; los dos documentos, con numeración de línea, van en el mensaje de
+# usuario (amp_agents.run.prepare_task). Los documentos congelados de la evaluación (~14,6 mil caracteres, unos 5000
+# tokens) más la definición y la gobernanza caben de sobra en num_ctx = 12288 junto con los 2048 tokens de salida.
+# Si falta context/agents/doc_checker_ss.md se usa la definición de doc_checker (definition_fallback).
+[agents.doc_checker_ss]
+mode = "single_shot"
+provider = "ollama"
+model = "phi4-mini"
+base_url = "http://localhost:11434"
+timeout = 240
+max_seconds = 300
+max_tokens = 2048
+tools = []
+read = ["context", "src"]
+write = []
+verifier = "doc_checker"
+definition_fallback = "doc_checker"
+
+[agents.doc_checker_ss.options]
+num_ctx = 12288
+temperature = 0.2
+
 [agents.code_reviewer]
 mode = "agent"
 provider = "ollama"

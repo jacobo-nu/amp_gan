@@ -16,6 +16,9 @@ Un único objeto JSON, sin texto alrededor:
 ```
 Si no encuentra nada: `{"hallazgos": []}`. La cita debe ser la línea literal del fichero.
 
+## Corrección de línea por código
+El modelo cita bien el texto pero desplaza el número de línea. `correct_review_lines` (`amp_agents.verifiers`) reasigna `linea` a la aparición de la cita más cercana a la que dio el modelo; si la cita no aparece, el hallazgo queda como no verificable y no se le inventa línea. La evaluación informa de las dos métricas (línea cruda y corregida).
+
 ## Permisos
 - Herramientas: `read_file`, `grep`, `list_dir`.
 - Lectura: `src/` y `context/`. Escritura: ninguna.

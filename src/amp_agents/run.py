@@ -6,6 +6,7 @@ Uso (desde la carpeta ``src``)::
     python -m amp_agents.run --agent executor --task-file encargo.md --model qwen2.5:14b
     python -m amp_agents.run --agent locator "¿Dónde se define la función hydrophobicity?"
     python -m amp_agents.run --agent doc_checker context/constitution/roadmap.md TODO.md --note "cifras y fechas"
+    python -m amp_agents.run --agent doc_checker_ss context/constitution/roadmap.md TODO.md --note "cifras y fechas"   # en una pasada, sin herramientas
     python -m amp_agents.run --agent code_reviewer src/amp_gan/properties.py
     python -m amp_agents.run --agent summarizer context/data/processed/cgan_hydro_metrics.csv context/data/processed/cgan_hydro_run_info.json
     python -m amp_agents.run --agent retriever "¿cómo se elige el backend por defecto?" --k 3 [--embedding [--build-index]]
@@ -166,6 +167,23 @@ def retrieve(
     return search(EmbeddingRetriever(index, provider, timeout=config.timeout), query, k)
 
 
+def number_lines(text: str) -> str:
+    """Texto con cada línea precedida de su número (desde 1) y un tabulador, como la salida de ``read_file``."""
+    return "\n".join(f"{number}\t{line}" for number, line in enumerate(text.splitlines(), start=1))
+
+
+def doc_checker_single_shot_task(documents: list[tuple[str, str]], note: str = "") -> str:
+    """Mensaje de usuario de ``doc_checker`` en una pasada: cada documento ``(ruta, texto)`` entero y con numeración de línea."""
+    aspect = f" Aspecto a comprobar: {note}." if note else ""
+    listing = ", ".join(f"`{path}`" for path, _ in documents)
+    blocks = "\n\n".join(f"### {path}\n```\n{number_lines(text)}\n```" for path, text in documents)
+    return (
+        f"Compara estos documentos y señala sus incoherencias: {listing}.{aspect}\n"
+        "Cada línea va precedida de su número y un tabulador; el número no forma parte del texto y no se copia en las "
+        "citas. Responde solo con el objeto JSON.\n\n" + blocks
+    )
+
+
 def prepare_task(agent: str, inputs: list[str], root: Path, note: str = "", max_chars: int = 8000, config_path: str | Path | None = None) -> tuple[str, dict]:
     """Construye el mensaje de usuario de un rol a partir de sus argumentos; devuelve ``(mensaje, contexto)``.
 
@@ -188,9 +206,11 @@ def prepare_task(agent: str, inputs: list[str], root: Path, note: str = "", max_
 
     if agent == "locator":
         return " ".join(inputs), {}
-    if agent == "doc_checker":
+    if agent == "doc_checker" or config.verifier == "doc_checker":
         if len(inputs) < 2:
             raise ConfigError("doc_checker necesita al menos dos rutas de documentos")
+        if config.mode == "single_shot":  # sin herramientas: los documentos enteros, con numeración de línea, en el mensaje
+            return doc_checker_single_shot_task([(p, read(p)) for p in inputs], note), {}
         aspect = f" Aspecto a comprobar: {note}." if note else ""
         listing = ", ".join(f"`{p}`" for p in inputs)
         return f"Compara estos documentos y señala sus incoherencias: {listing}.{aspect}", {}

@@ -20,10 +20,8 @@ REAL_ROOT = SRC.parent
 
 
 def real_docs():
-    return (
-        (REAL_ROOT / "context" / "constitution" / "roadmap.md").read_text(encoding="utf-8"),
-        (REAL_ROOT / "TODO.md").read_text(encoding="utf-8"),
-    )
+    """Los documentos CONGELADOS de la evaluación (``amp_agents/fixtures/``), no los vivos del repositorio, que cambian."""
+    return E.frozen_docs()
 
 
 # -- criterios declarados -------------------------------------------------------------------------------------------
@@ -350,3 +348,123 @@ def test_script_is_not_collected_by_pytest_and_has_a_cli():
     done = subprocess.run([sys.executable, "-m", "amp_agents.eval_roles", "--help"], cwd=SRC, capture_output=True, text=True, timeout=60)
     assert done.returncode == 0 and "locator" in done.stdout and "--env-variant" in done.stdout
     assert "NO es un test" in E.__doc__.upper() or "no es un test" in E.__doc__
+
+
+# -- documentos congelados de la evaluación del doc_checker --------------------------------------------------------------------
+def test_frozen_documents_are_independent_of_the_live_ones():
+    roadmap, todo = E.frozen_docs()
+    assert (E.FIXTURES_DIR / "roadmap.md").is_file() and (E.FIXTURES_DIR / "TODO.md").is_file()
+    assert "hecha en `feat/wgan-gp` (4 de 5 condiciones" in todo and "cumple 4 de las 5 condiciones" in roadmap  # texto de la evaluación original
+    new_roadmap, new_todo, seeds = E.seed_documents(roadmap, todo)  # las seis siembras se aplican, una vez cada una
+    assert len(seeds) == 6 and {s["file"] for s in seeds} == {E.TODO_REL} and E.TODO_REL == "context/TODO.md"
+    assert new_roadmap == roadmap and new_todo != todo
+
+
+def test_make_copy_leaves_the_frozen_documents_out_of_the_consulted_material(tmp_path):
+    copy = E.make_copy(tmp_path / "copia")
+    assert not (copy / "src" / "amp_agents" / "fixtures").exists()
+    assert (E.FIXTURES_DIR / "TODO.md").is_file()  # el original no se toca
+
+
+# -- doc_checker_ss: mismo protocolo y criterios que doc_checker --------------------------------------------------------------
+def test_doc_checker_ss_reads_the_criteria_of_doc_checker_without_duplicating_them():
+    assert E.base_role("doc_checker_ss") == "doc_checker" and E.base_role("summarizer") == "summarizer"
+    assert "doc_checker_ss" not in E.CRITERIA and "doc_checker_ss" not in E.REPS  # una sola entrada con los números
+    assert "doc_checker_ss" not in E.ROLES and "doc_checker_ss" not in E.ALL_ROLES  # no entra en `all`
+    assert "doc_checker_ss" in E.COMMAND_ROLES and "doc_checker_ss" in E.EVALUATORS
+
+
+def run_ss_evaluation(tmp_path, monkeypatch, answers, role="doc_checker_ss", limit=None, reps=1):
+    """Ejecuta ``evaluate_role`` con un proveedor guionizado (sin Ollama) y devuelve ``(resultado, results_dir, proveedor)``."""
+    from amp_agents import run as R
+    from amp_agents.providers import ScriptedProvider
+
+    scripted = ScriptedProvider(answers)
+    monkeypatch.setattr(R, "make_provider", lambda config: scripted)
+    monkeypatch.setattr(E, "server_models", lambda base_url: ["phi4-mini:latest"])
+    monkeypatch.setattr(E, "ollama_ps", lambda *a, **k: {})
+    monkeypatch.setattr(E, "ollama_stop", lambda model: "ok")
+    monkeypatch.setattr(E, "ollama_ps_text", lambda: "")
+    args = E.argparse.Namespace(workdir=str(tmp_path / "w"), results_dir=str(tmp_path / "r"), env_variant=1, tag="", reps=reps, limit=limit, drop=None)
+    return E.evaluate_role(role, args), tmp_path / "r", scripted
+
+
+def ss_answers():
+    roadmap, todo = E.frozen_docs()
+    _, _, seeds = E.seed_documents(roadmap, todo)
+    cifra = next(s for s in seeds if s["id"] == "cifra")
+    seeded = {
+        "incoherencias": [
+            {
+                "descripcion": "cifra distinta",
+                "evidencia_a": {"ruta": E.TODO_REL, "cita": cifra["new"]},
+                "evidencia_b": {"ruta": E.ROADMAP_REL, "cita": "cumple 4 de las 5 condiciones"},
+            }
+        ]
+    }
+    return json.dumps(seeded), json.dumps({"incoherencias": []})
+
+
+def test_doc_checker_ss_is_evaluated_with_its_own_name_and_the_same_protocol(tmp_path, monkeypatch):
+    out, results, scripted = run_ss_evaluation(tmp_path, monkeypatch, list(ss_answers()))
+    assert out["role"] == "doc_checker_ss" and out["protocol"] == E.CRITERIA["doc_checker"]
+    assert [r["role"] for r in out["runs"]] == ["doc_checker_ss", "doc_checker_ss"] and [r["case"] for r in out["runs"]] == ["seeded", "clean"]
+    assert all(r["success"] and r["json_valid"] and r["stop_reason"] == "final" and r["steps"] == 1 and not r["copy_modified"] for r in out["runs"])
+    for name in ("doc_checker_ss.json", "doc_checker_ss.md", "doc_checker_ss.runs.jsonl", "seeds_doc_checker_ss.json"):
+        assert (results / name).is_file(), name
+    assert not (results / "doc_checker.json").exists()  # no pisa los resultados del rol base
+    criteria = out["criteria"]
+    assert [c[0] for c in criteria] == [c[0] for c in E._doc_summary([], [])["criteria"]] and [c[1] for c in criteria] == [">= 90 %", ">= 4", "<= 2"]
+    assert out["metrics"]["valid_citations"] == 2 == out["metrics"]["citations"] and out["metrics"]["recovered_per_rep"] == [1]
+    assert criteria[0][3] is True and criteria[1][3] is False and criteria[2][3] is True  # 1 de 6 < 4: el umbral no se rebaja
+    # una pasada, sin herramientas, con los documentos CONGELADOS (sembrados en la copia del caso «seeded») en el mensaje
+    user = scripted.received[0][1]["content"]
+    assert "### context/constitution/roadmap.md" in user and "### context/TODO.md" in user and "3 de 5 condiciones" in user
+    assert "4 de 5 condiciones" in scripted.received[1][1]["content"]  # la copia limpia lleva el texto original
+    assert (tmp_path / "w" / "doc_checker_ss_seeded").is_dir() and (tmp_path / "w" / "doc_checker_ss_clean").is_dir()
+    assert not (tmp_path / "w" / "doc_checker_ss_seeded" / "src" / "amp_agents" / "fixtures").exists()
+    assert "doc_checker_ss" in (results / "doc_checker_ss.md").read_text(encoding="utf-8")
+    assert scripted.timeouts == [E.get_agent_config("doc_checker_ss").max_seconds] * 2
+
+
+def test_doc_checker_ss_counts_invented_quotes_as_invalid(tmp_path, monkeypatch):
+    invented = json.dumps({"incoherencias": [{"descripcion": "d", "evidencia_a": {"ruta": E.TODO_REL, "cita": "frase inventada"}, "evidencia_b": {"ruta": E.ROADMAP_REL, "cita": "otra inventada"}}]})
+    out, _, _ = run_ss_evaluation(tmp_path, monkeypatch, [invented, '{"incoherencias": []}'])
+    assert out["metrics"]["valid_citations"] == 0 and out["metrics"]["citations"] == 2
+    assert out["criteria"][0][3] is False
+    assert [r["success"] for r in out["runs"]] == [False, True]
+
+
+def test_doc_checker_ss_limit_runs_only_the_first_cases(tmp_path, monkeypatch):
+    out, _, scripted = run_ss_evaluation(tmp_path, monkeypatch, [ss_answers()[0]], limit=1)
+    assert [r["case"] for r in out["runs"]] == ["seeded"] and len(scripted.received) == 1
+    assert out["criteria"][2][2] == "- []" and out["criteria"][2][3] is False  # sin copia limpia no hay medida de falsos positivos
+
+
+def test_doc_checker_agent_evaluation_also_uses_the_frozen_documents(tmp_path, monkeypatch):
+    from amp_agents import run as R
+    from amp_agents.providers import AssistantMessage, ScriptedProvider
+
+    monkeypatch.setattr(E, "server_models", lambda base_url: ["phi4-mini"])
+    seeded, clean = ss_answers()
+    scripted = ScriptedProvider([AssistantMessage.calls(("read_file", {"path": E.TODO_REL})), seeded, clean])
+    monkeypatch.setattr(R, "make_provider", lambda config: scripted)
+    monkeypatch.setattr(E, "ollama_ps", lambda *a, **k: {})
+    monkeypatch.setattr(E, "ollama_stop", lambda model: "ok")
+    monkeypatch.setattr(E, "ollama_ps_text", lambda: "")
+    args = E.argparse.Namespace(workdir=str(tmp_path / "w"), results_dir=str(tmp_path / "r"), env_variant=1, tag="", reps=1, limit=None, drop=None)
+    out = E.evaluate_role("doc_checker", args)
+    assert out["role"] == "doc_checker" and [r["role"] for r in out["runs"]] == ["doc_checker", "doc_checker"]
+    assert (tmp_path / "r" / "doc_checker.json").is_file() and (tmp_path / "r" / "seeds_doc_checker.json").is_file()
+    read = scripted.received[1][-1]["content"]  # resultado de read_file sobre la copia sembrada
+    assert "3 de 5 condiciones" in read
+    assert out["metrics"]["valid_citations"] == 2
+
+
+def test_all_can_include_doc_checker_ss_only_when_asked(monkeypatch, tmp_path):
+    called = []
+    monkeypatch.setattr(E, "evaluate_role", lambda role, args: called.append(role))
+    work = str(tmp_path / "w")
+    assert E.main(["all", "--workdir", work, "--roles", "doc_checker,doc_checker_ss"]) == 0 and called == ["doc_checker", "doc_checker_ss"]
+    called.clear()
+    assert E.main(["doc_checker_ss", "--workdir", work]) == 0 and called == ["doc_checker_ss"]

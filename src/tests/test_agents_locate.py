@@ -171,7 +171,7 @@ def test_the_new_files_do_not_alter_the_evaluation_truth(tmp_path):
 # -- el localizador con modelo está retirado de la evaluación por defecto ----------------------------------------------------------
 def test_locator_is_retired_from_the_default_evaluation_but_still_evaluable():
     assert "locator" not in E.ROLES and E.RETIRED_ROLES == ("locator",)
-    assert E.ALL_ROLES == ("locator", *E.ROLES) and set(E.EVALUATORS) == set(E.ALL_ROLES)
+    assert E.ALL_ROLES == ("locator", *E.ROLES) and set(E.EVALUATORS) == set(E.COMMAND_ROLES)  # los roles de `all` más las variantes (doc_checker_ss)
     assert "locator" in E.CRITERIA and "locator" in E.REPS and "locator" in E.EVALUATORS  # el código de evaluación se conserva
     assert get_agent_config("locator").model == "llama3.2:3b"  # y la sección de configuración también
     toml = (tmp_root() / "src" / "amp_agents" / "agents.toml").read_text(encoding="utf-8")
