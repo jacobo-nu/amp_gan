@@ -8,7 +8,7 @@ Uso (desde la carpeta ``src``)::
     python -m amp_agents.run --agent doc_checker context/constitution/roadmap.md TODO.md --note "cifras y fechas"
     python -m amp_agents.run --agent code_reviewer src/amp_gan/properties.py
     python -m amp_agents.run --agent summarizer context/data/processed/cgan_hydro_metrics.csv context/data/processed/cgan_hydro_run_info.json
-    python -m amp_agents.run --agent retriever "¿cómo se elige el backend por defecto?" --k 3 [--lexical] [--build-index]
+    python -m amp_agents.run --agent retriever "¿cómo se elige el backend por defecto?" --k 3 [--embedding [--build-index]]
 
 El primer argumento posicional depende del rol: ``locator`` y ``retriever`` reciben la pregunta; ``doc_checker`` dos
 o más rutas de documentos; ``code_reviewer`` la ruta de un fichero de ``src/``; ``summarizer`` las rutas de los
@@ -31,7 +31,8 @@ Opciones:
                    úsese una copia para pruebas
     --log-dir      carpeta de registros JSONL (por defecto ``<root>/.agent_runs``)
     --config       otro ``agents.toml``
-    --k, --lexical, --build-index   solo ``retriever`` (nº de resultados, línea base léxica, reconstruir el índice)
+    --k, --lexical, --embedding, --build-index   solo ``retriever`` (nº de resultados; BM25 léxico, que es lo que se usa por
+                   defecto según ``search_backend``; embeddings, que exigen el servidor y el índice; reconstruir el índice)
 
 Código de salida: 0 si el motivo de parada es ``final`` (y la verificación, si la hay, es válida); 1 si no; 2 por error de
 configuración o de uso. El informe final se escribe en la salida estándar y un resumen (pasos, tokens, tiempo, registro)
@@ -131,18 +132,22 @@ def retrieve(
     root: str | Path | None = None,
     config_path: str | Path | None = None,
     k: int = 3,
-    lexical: bool = False,
+    lexical: bool | None = None,
     build: bool = False,
     embedder=None,
     **overrides,
 ) -> list[dict]:
     """Rol ``retriever``: los ``k`` fragmentos más cercanos a ``query`` (``ruta``, ``linea``, ``puntuacion``, ``texto``).
 
-    Con ``lexical=True`` usa la línea base léxica (sin modelo). Si no, usa el índice de embeddings de ``index_dir``;
-    se construye (y guarda) si no existe o si ``build=True``. ``embedder`` permite inyectar un proveedor simulado.
+    Por defecto usa el recuperador léxico BM25 (sin modelo ni índice), el que fija ``search_backend`` en la
+    configuración del rol. Los embeddings son una opción explícita: ``lexical=False`` o ``search_backend = "embedding"``;
+    entonces se usa el índice de ``index_dir``, que se construye (y guarda) si no existe o si ``build=True``.
+    ``lexical`` (si no es ``None``) manda sobre la configuración. ``embedder`` permite inyectar un proveedor simulado.
     """
     config = get_agent_config("retriever", config_path, **overrides)
     base = Path(root).resolve() if root else PROJECT_ROOT
+    if lexical is None:
+        lexical = config.search_backend == "lexical"
     chunks = chunk_project(base)
     if lexical:
         return search(LexicalRetriever(chunks), query, k)
@@ -222,7 +227,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log-dir", dest="log_dir")
     parser.add_argument("--config")
     parser.add_argument("--k", type=int, default=3)
-    parser.add_argument("--lexical", action="store_true")
+    parser.add_argument("--lexical", action="store_true", help="solo retriever: BM25 sin modelo (es lo que usa por defecto)")
+    parser.add_argument("--embedding", action="store_true", help="solo retriever: embeddings (necesita el índice y el servidor de modelos)")
     parser.add_argument("--build-index", dest="build_index", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -231,10 +237,15 @@ def main(argv: list[str] | None = None) -> int:
         if config.mode == "embedding":
             if not args.inputs:
                 raise ConfigError("el recuperador necesita una consulta")
-            hits = retrieve(" ".join(args.inputs), root=base, config_path=args.config, k=args.k, lexical=args.lexical, build=args.build_index, model=args.model, base_url=args.base_url)
+            if args.lexical and args.embedding:
+                raise ConfigError("--lexical y --embedding son incompatibles")
+            use_lexical = True if args.lexical else False if args.embedding else None
+            if use_lexical is None:
+                use_lexical = config.search_backend == "lexical"
+            hits = retrieve(" ".join(args.inputs), root=base, config_path=args.config, k=args.k, lexical=use_lexical, build=args.build_index, model=args.model, base_url=args.base_url)
             print(json.dumps(hits, ensure_ascii=False, indent=1))
             check = verify(config.verifier, json.dumps(hits)) if config.verifier else Verification(True)
-            print(f"[retriever/{'lexical' if args.lexical else 'embedding'}] resultados={len(hits)} verificación={'ok' if check.valid else check.errors}", file=sys.stderr)
+            print(f"[retriever/{'lexical' if use_lexical else 'embedding'}] resultados={len(hits)} verificación={'ok' if check.valid else check.errors}", file=sys.stderr)
             return 0 if check.valid else 1
         context: dict = {}
         if args.task_file:

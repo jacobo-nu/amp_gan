@@ -37,8 +37,13 @@ temperature = 0.2
 # verifier: nombre de la comprobación automática de la salida (amp_agents.verifiers). La salida de estos roles
 # no se da por buena sin pasar por ella.
 # search_docs (herramienta de solo lectura) se puede añadir a `tools` de cualquier rol de modo agent; por defecto
-# ningún rol la tiene. search_backend = "lexical" (sin modelo) o "embedding" (usa el índice y el rol retriever).
+# ningún rol la tiene. search_backend = "lexical" (BM25 sin modelo ni índice; es el valor POR DEFECTO, también para el
+# rol retriever y para search_docs) o "embedding" (opción explícita: usa el índice y el modelo del rol retriever; en la
+# evaluación en vivo puntuó por debajo de BM25, 60 % frente a 73 % en el top-3).
 
+# RETIRADO: el localizador con modelo (llama3.2:3b) acertó el 10 % en la evaluación en vivo y lo que hace es `grep`.
+# La función determinista amp_agents.locate.locate() lo sustituye. Esta sección y su evaluación (eval_roles locator, o
+# `all --roles locator`) se conservan solo para reproducir el resultado negativo; `all` ya no lo incluye.
 [agents.locator]
 mode = "agent"
 provider = "ollama"
@@ -122,6 +127,7 @@ tools = []
 read = ["context", "src"]
 write = []                      # solo escribe el índice, en index_dir (fuera del control de versiones)
 index_dir = ".agent_runs/index"
+search_backend = "lexical"      # BM25 por defecto; "embedding" (nomic-embed-text y el índice de index_dir) solo si se pide
 verifier = "retriever"
 
 [agents.retriever.options]

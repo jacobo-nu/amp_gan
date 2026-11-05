@@ -13,8 +13,11 @@ Módulos:
   herramientas (``run_single_shot``), con registro JSONL.
 - :mod:`amp_agents.agents`: configuración (``agents.toml``) y ensamblado del prompt de sistema.
 - :mod:`amp_agents.retrieval`: recuperador de documentación (troceado, índice de embeddings, línea base léxica,
-  herramienta ``search_docs``).
-- :mod:`amp_agents.verifiers`: comprobación automática de la salida de los roles (JSON, citas, líneas, cifras).
+  herramienta ``search_docs``). La búsqueda léxica BM25 es la de por defecto; los embeddings, opcionales.
+- :mod:`amp_agents.locate`: localización determinista de definiciones, importaciones y apariciones (sustituye al
+  localizador con modelo, retirado).
+- :mod:`amp_agents.verifiers`: comprobación automática de la salida de los roles (JSON, citas, líneas, cifras) y correcciones por código
+  (línea del revisor, recorte y coma decimal del resumidor).
 - :mod:`amp_agents.run`: línea de órdenes (``--agent`` ejecutor, localizador, verificador documental, revisor de
   código, resumidor o recuperador).
 - :mod:`amp_agents.eval_roles`: evaluación en vivo de los roles con protocolo y criterios fijos (no es un test).

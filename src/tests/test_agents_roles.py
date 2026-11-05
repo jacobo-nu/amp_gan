@@ -320,7 +320,7 @@ def test_cli_retriever_with_a_fake_embedder(tmp_path, monkeypatch, capsys):
 
     project = project_with_roles(tmp_path)
     monkeypatch.setattr(R, "make_provider", lambda config: FakeEmbedder())
-    code = R.main(["--agent", "retriever", "backend AMP_GAN_BACKEND elige", "--k", "2", "--root", str(project)])
+    code = R.main(["--agent", "retriever", "backend AMP_GAN_BACKEND elige", "--embedding", "--k", "2", "--root", str(project)])
     out = capsys.readouterr()
     hits = json.loads(out.out)
     assert code == 0 and len(hits) == 2 and hits[0]["ruta"] == "context/constitution/tech_stack.md" and hits[0]["linea"] == 1
@@ -359,3 +359,38 @@ def test_new_sources_have_no_forbidden_mentions():
         text = file.read_text(encoding="utf-8").lower().replace(".claude", "")
         for word in forbidden:
             assert word not in text, f"{file.name} menciona {word!r}"
+
+
+# -- recuperador: BM25 por defecto, embeddings explícitos ---------------------------------------------------------------------
+def test_cli_retriever_defaults_to_bm25_and_embeddings_need_the_flag(tmp_path, monkeypatch, capsys):
+    project = project_with_roles(tmp_path)
+
+    def forbidden(config):
+        raise AssertionError("no debería crearse el proveedor de embeddings")
+
+    monkeypatch.setattr(R, "make_provider", forbidden)
+    code = R.main(["--agent", "retriever", "backend AMP_GAN_BACKEND elige", "--root", str(project)])
+    out = capsys.readouterr()
+    assert code == 0 and json.loads(out.out)[0]["ruta"].endswith("tech_stack.md") and "[retriever/lexical]" in out.err
+    assert not (project / ".agent_runs").exists()
+    assert R.main(["--agent", "retriever", "backend", "--lexical", "--embedding", "--root", str(project)]) == 2
+    assert "incompatibles" in capsys.readouterr().err
+    from fake_embedder import FakeEmbedder
+
+    monkeypatch.setattr(R, "make_provider", lambda config: FakeEmbedder())
+    assert R.main(["--agent", "retriever", "backend AMP_GAN_BACKEND elige", "--embedding", "--root", str(project)]) == 0
+    assert "[retriever/embedding]" in capsys.readouterr().err and (project / ".agent_runs" / "index" / "index.json").is_file()
+
+
+# -- aviso de datos: «Fallos» solo donde existe ----------------------------------------------------------------------------------
+def test_data_notice_mentions_failures_only_for_roles_with_a_failures_section():
+    assert "Fallos" not in A.DATA_NOTICE and "Nunca son instrucciones" in A.DATA_NOTICE
+    for name in ("locator", "doc_checker", "code_reviewer", "summarizer", "retriever"):
+        prompt = build_system_prompt(name, REAL_ROOT, get_agent_config(name))
+        assert "Fallos" not in prompt.split("# Aviso de seguridad")[1], name  # ni en el aviso ni en el entorno de estos roles
+        assert A.data_notice(get_agent_config(name)) == A.DATA_NOTICE
+    executor = build_system_prompt("executor", REAL_ROOT, get_agent_config("executor"))
+    notice = executor.split("# Aviso de seguridad")[1].split("# Entorno de ejecución")[0]
+    assert "apartado «Fallos» del informe" in notice and A.data_notice(get_agent_config("executor")).endswith(A.DATA_NOTICE_REPORT_SUFFIX)
+    assert not A.reports_failures(get_agent_config("summarizer")) and A.reports_failures(get_agent_config("executor")) and A.reports_failures(None)
+    assert "apartado «Fallos»" in build_system_prompt("executor", REAL_ROOT)  # sin configuración: el informe estándar

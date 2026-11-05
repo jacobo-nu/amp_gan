@@ -323,12 +323,12 @@ def test_retrieve_builds_saves_and_reuses_the_index(tmp_path):
 
     root = _search_project(tmp_path)
     fake = FakeEmbedder()
-    first = retrieve("backend AMP_GAN_BACKEND", root=root, k=1, embedder=fake)
+    first = retrieve("backend AMP_GAN_BACKEND", root=root, k=1, lexical=False, embedder=fake)
     assert first[0]["ruta"] == "context/constitution/tech_stack.md" and (root / ".agent_runs" / "index" / "index.json").is_file()
     document_calls = sum(1 for call in fake.calls if call[0].startswith("search_document"))
-    retrieve("gobernanza ramas", root=root, k=1, embedder=fake)
+    retrieve("gobernanza ramas", root=root, k=1, lexical=False, embedder=fake)
     assert sum(1 for call in fake.calls if call[0].startswith("search_document")) == document_calls  # no reindexa
-    retrieve("gobernanza ramas", root=root, k=1, embedder=fake, build=True)
+    retrieve("gobernanza ramas", root=root, k=1, lexical=False, embedder=fake, build=True)
     assert sum(1 for call in fake.calls if call[0].startswith("search_document")) == 2 * document_calls
     lexical = retrieve("gobernanza ramas", root=root, k=1, lexical=True)
     assert lexical[0]["ruta"] == "context/agents/otro.md"
@@ -339,3 +339,81 @@ def test_index_dir_can_be_configured_and_absolute(tmp_path):
     assert RT.resolve_index_dir(root) == root / ".agent_runs" / "index"
     assert RT.resolve_index_dir(root, "otro/sitio") == root / "otro" / "sitio"
     assert RT.resolve_index_dir(root, tmp_path / "abs") == tmp_path / "abs"
+
+
+# -- BM25 estándar y recuperador léxico por defecto -------------------------------------------------------------------------------
+def test_lexical_retriever_is_okapi_bm25_with_k1_1_5_and_b_0_75():
+    # puntuación calculada a mano con la fórmula de BM25 (idf no negativo de Lucene), sin reutilizar el código del recuperador
+    chunks = [RT.Chunk("x1.md", 1, "alfa beta"), RT.Chunk("x2.md", 1, "alfa alfa gamma delta"), RT.Chunk("x3.md", 1, "gamma")]
+    lengths = [4, 6, 3]  # la ruta aporta dos palabras («x1», «md»)
+    avg = sum(lengths) / 3
+    k1, b = 1.5, 0.75
+    idf = math.log(1 + (3 - 2 + 0.5) / (2 + 0.5))  # «alfa» está en 2 de los 3 fragmentos
+    expected = {
+        "x1.md": idf * 1 * (k1 + 1) / (1 + k1 * (1 - b + b * lengths[0] / avg)),
+        "x2.md": idf * 2 * (k1 + 1) / (2 + k1 * (1 - b + b * lengths[1] / avg)),
+    }
+    retriever = RT.LexicalRetriever(chunks)
+    assert (retriever.k1, retriever.b) == (1.5, 0.75)
+    hits = retriever.search("alfa", 5)
+    assert [h.ruta for h in hits] == ["x2.md", "x1.md"] and expected["x2.md"] > expected["x1.md"]
+    for hit in hits:
+        assert hit.puntuacion == pytest.approx(expected[hit.ruta])
+    # una consulta con un término repetido o con palabras vacías puntúa igual (los términos son distintos y sin vacías)
+    assert [h.puntuacion for h in retriever.search("el alfa alfa", 5)] == [h.puntuacion for h in hits]
+    # dos términos suman sus contribuciones
+    two = retriever.search("alfa gamma", 5)
+    idf_gamma = math.log(1 + (3 - 2 + 0.5) / (2 + 0.5))
+    only_x2 = idf * 2 * (k1 + 1) / (2 + k1 * (1 - b + b * lengths[1] / avg)) + idf_gamma * 1 * (k1 + 1) / (1 + k1 * (1 - b + b * lengths[1] / avg))
+    assert next(h for h in two if h.ruta == "x2.md").puntuacion == pytest.approx(only_x2)
+
+
+def test_search_backend_is_lexical_by_default_everywhere():
+    assert A.AgentConfig(name="x", model="m").search_backend == "lexical"
+    assert A.get_agent_config("retriever").search_backend == "lexical"
+    assert A.get_agent_config("executor").search_backend == "lexical"
+    assert A.get_agent_config("retriever", search_backend="embedding").search_backend == "embedding"  # opción explícita
+    toml = (Path(A.__file__).parent / "agents.toml").read_text(encoding="utf-8")
+    retriever_section = toml.split("[agents.retriever]")[1].split("[agents.retriever.options]")[0]
+    assert 'search_backend = "lexical"' in retriever_section and "embedding" in retriever_section  # el comentario explica la opción
+    assert RT.search_docs_tool.__defaults__[0] == "lexical"
+
+
+class _ForbiddenEmbedder:
+    """Cualquier uso lanza: demuestra que el camino por defecto no toca los embeddings."""
+
+    def embed(self, texts, timeout=None):
+        raise AssertionError("no debería usarse el modelo de embeddings")
+
+
+def test_retrieve_uses_bm25_by_default_without_touching_the_embedder_or_writing_an_index(tmp_path):
+    from amp_agents.run import retrieve
+
+    root = _search_project(tmp_path)
+    hits = retrieve("gobernanza ramas", root=root, k=1, embedder=_ForbiddenEmbedder())
+    assert hits[0]["ruta"] == "context/agents/otro.md" and hits[0]["puntuacion"] > 0
+    assert hits == retrieve("gobernanza ramas", root=root, k=1, lexical=True)
+    assert not (root / ".agent_runs").exists()  # no hay índice: BM25 trocea en memoria
+
+
+def test_retrieve_lets_the_configuration_and_the_explicit_flag_choose_embeddings(tmp_path):
+    from amp_agents.run import retrieve
+
+    root = _search_project(tmp_path)
+    fake = FakeEmbedder()
+    by_config = retrieve("backend AMP_GAN_BACKEND", root=root, k=1, embedder=fake, search_backend="embedding")
+    assert by_config[0]["ruta"] == "context/constitution/tech_stack.md" and (root / ".agent_runs" / "index" / "index.json").is_file() and fake.calls
+    fake2 = FakeEmbedder()
+    retrieve("backend", root=root, k=1, embedder=fake2, lexical=False)
+    assert fake2.calls  # el indicador explícito también
+    # lexical manda sobre la configuración
+    assert retrieve("gobernanza ramas", root=root, k=1, embedder=_ForbiddenEmbedder(), lexical=True, search_backend="embedding")[0]["ruta"] == "context/agents/otro.md"
+
+
+def test_search_docs_tool_of_a_default_role_is_lexical_and_needs_no_embedder(tmp_path):
+    root = _search_project(tmp_path)
+    cfg = A.AgentConfig(name="x", model="m", tools=["search_docs"], write=[])  # sin tocar search_backend
+    (tool,) = A.make_tools(cfg)  # no pide el modelo del recuperador
+    out = tool.run(A.make_policy(cfg, root), {"query": "gobernanza ramas", "k": 1})
+    assert out.ok and out.content.startswith("context/agents/otro.md:1")
+    assert not (root / ".agent_runs").exists()

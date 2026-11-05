@@ -2,12 +2,12 @@
 
 Uso (desde la carpeta ``src``, con Ollama en marcha y los modelos descargados)::
 
-    python -m amp_agents.eval_roles locator       --workdir /ruta/a/carpeta/vacia
+    python -m amp_agents.eval_roles locator       --workdir /ruta/a/carpeta/vacia   # RETIRADO: solo para reproducir el resultado
     python -m amp_agents.eval_roles doc_checker   --workdir ...
     python -m amp_agents.eval_roles code_reviewer --workdir ...
     python -m amp_agents.eval_roles summarizer    --workdir ...
     python -m amp_agents.eval_roles retriever     --workdir ...
-    python -m amp_agents.eval_roles all           --workdir ... --deadline-min 90
+    python -m amp_agents.eval_roles all           --workdir ... --deadline-min 90   # sin el localizador; añádelo con --roles locator,...
     python -m amp_agents.eval_roles report        --results-dir ...
 
 Todo se hace sobre COPIAS dentro de ``--workdir`` (``context/`` sin ``context/data/`` y ``src/``, sin este script ni
@@ -37,6 +37,12 @@ PROTOCOLO Y CRITERIOS (fijados de antemano; no se ajustan tras ver los resultado
 - retriever (``nomic-embed-text``): 15 consultas en castellano con verdad escrita a mano (fichero y palabra clave en
   el fragmento). Criterio: acierto en el top-3 >= 80 %. Se mide igual la línea base léxica (BM25).
 
+Segunda iteración (los criterios de arriba NO cambian): el localizador con modelo queda retirado (10 % de aciertos; lo
+sustituye ``amp_agents.locate``) y ``all`` no lo incluye por defecto. Para el revisor y el resumidor, los criterios se
+siguen juzgando sobre la salida CRUDA del modelo, y se informa además, en filas marcadas «[... por código]» con el mismo
+umbral, de la salida corregida por código por encima: línea del revisor reasignada a la de su cita literal
+(``verifiers.correct_review_lines``) y resumen con coma decimal y recortado a 150 palabras (``verifiers.postprocess_summary``).
+
 Las ejecuciones fallidas (JSON inválido, tiempo agotado, error del servidor) cuentan como no exitosas y se anotan.
 Por ejecución se registra: éxito, pasos, tokens, segundos, motivo de parada, contexto efectivo (``/api/ps``) y si el
 modelo se pasó parcialmente a la CPU.
@@ -45,9 +51,7 @@ modelo se pasó parcialmente a la CPU.
 from __future__ import annotations
 
 import argparse
-import ast
 import json
-import re
 import shutil
 import subprocess
 import sys
@@ -59,6 +63,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .agents import PROJECT_ROOT, get_agent_config
+from .locate import find_definitions, find_lines  # noqa: F401 (la verdad del localizador; se reexportan)
 from .loop import AgentResult
 from .retrieval import LexicalRetriever, chunk_project
 from .run import prepare_task, retrieve, run_task
@@ -67,12 +72,22 @@ from .smoke_live import server_models, snapshot
 from .verifiers import (
     check_doc_citations,
     check_review_citations,
+    correct_review_lines,
+    count_words,
     parse_json_output,
+    postprocess_summary,
     retrieval_rank,
+    spanish_score,
+    verifiable_findings,
     verify,
 )
 
-ROLES = ("locator", "doc_checker", "code_reviewer", "summarizer", "retriever")
+# ``ROLES`` son los que se evalúan por defecto con ``all``. El localizador con modelo (``llama3.2:3b``) está RETIRADO:
+# 10 % de aciertos y ``grep`` (``amp_agents.locate``) ya lo hace; su evaluación se conserva para reproducir el resultado
+# negativo y se pide expresamente (``locator`` o ``all --roles locator``).
+ROLES = ("doc_checker", "code_reviewer", "summarizer", "retriever")
+RETIRED_ROLES = ("locator",)
+ALL_ROLES = ("locator", *ROLES)
 DEFAULT_WORKDIR = Path(tempfile.gettempdir()) / "amp_roles_eval"
 EXCLUDED_FROM_COPY = ("src/amp_agents/eval_roles.py",)  # y src/tests/test_agents_eval*.py
 
@@ -234,35 +249,6 @@ class Recorder:
 
 
 # -- locator -----------------------------------------------------------------------------------------------------
-def _py_files(root: Path) -> list[Path]:
-    return sorted(p for p in (root / "src").rglob("*.py") if "__pycache__" not in p.parts and not any(part.startswith(".") for part in p.relative_to(root).parts))
-
-
-def find_definitions(root: Path, name: str) -> list[tuple[str, int]]:
-    """Pares (ruta, línea) de las definiciones ``def``/``class`` de ``name`` en los ``.py`` de ``src/`` (con ``ast``)."""
-    out = []
-    for path in _py_files(root):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except SyntaxError:
-            continue
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name:
-                out.append((path.relative_to(root).as_posix(), node.lineno))
-    return sorted(out)
-
-
-def find_lines(root: Path, pattern: str) -> list[tuple[str, int]]:
-    """Pares (ruta, línea) de las líneas de los ``.py`` de ``src/`` que cumplen la expresión regular ``pattern``."""
-    regex = re.compile(pattern)
-    out = []
-    for path in _py_files(root):
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            if regex.search(line):
-                out.append((path.relative_to(root).as_posix(), number))
-    return sorted(out)
-
-
 def locator_questions(root: Path) -> list[dict]:
     """Las 10 preguntas del localizador con la verdad calculada sobre la copia ``root``."""
     questions = []
@@ -674,34 +660,63 @@ def eval_code_reviewer(args, rec: Recorder, work: Path, results: Path) -> dict:
             valid_output = bool(verification and verification.details.get("schema_ok"))
             match = match_code_findings(obj, seeds if name == "seeded" else []) if valid_output else {"recovered": [], "false_positives": [], "n_findings": 0}
             citations = verification.details.get("citations", []) if verification else []
+            # salida CORREGIDA por código (línea reasignada a la de la cita literal); la cruda es la que juzgan los criterios
+            correction = verification.details.get("line_correction") if verification and valid_output else None
+            match_fixed = match_code_findings(verifiable_findings(correction["obj"]), seeds if name == "seeded" else []) if correction else {"recovered": [], "false_positives": [], "n_findings": 0}
             if name == "seeded":
                 ok = valid_output and len(match["recovered"]) >= 1
                 notes = f"hallazgos={match['n_findings']} recuperados={len(match['recovered'])}/5 {match['recovered']} sin_defecto_cerca={len(match['false_positives'])}"
+                if correction:
+                    notes += f" | línea corregida: recuperados={len(match_fixed['recovered'])}/5 {match_fixed['recovered']} corregidas={correction['corrected']} no_verificables={correction['unverifiable']}"
             else:
                 ok = valid_output and match["n_findings"] <= CRITERIA["code_reviewer"]["false_positives_max"]
                 notes = f"hallazgos_en_copia_limpia={match['n_findings']}"
             if not valid_output:
                 notes += f" salida no utilizable: {(verification.errors[:2] if verification else 'parada ' + result.stop_reason)}"
-            details = {"copy": name, "match": match, "citations": citations, "valid_output": valid_output, "seeds": seeds if name == "seeded" else []}
+            details = {
+                "copy": name, "match": match, "citations": citations, "valid_output": valid_output, "seeds": seeds if name == "seeded" else [],
+                "match_corrected": match_fixed, "line_correction": None if not correction else {k: v for k, v in correction.items() if k != "obj"},
+            }
             rec.add(_system_record("code_reviewer", name, rep, result, root, before, args.env_variant, ok, notes, details, verification))
-            entry[name] = {"recovered": len(match["recovered"]), "findings": match["n_findings"], "valid_output": valid_output}
+            entry[name] = {
+                "recovered": len(match["recovered"]), "findings": match["n_findings"], "valid_output": valid_output,
+                "recovered_corrected": len(match_fixed["recovered"]), "findings_verifiable": correction["verifiable"] if correction else 0,
+            }
         per_rep.append(entry)
     return _code_summary(rec.runs, per_rep)
 
 
 def _code_summary(runs: list[RunRecord], per_rep: list[dict]) -> dict:
+    """Resumen del revisor: los criterios (fijados) se juzgan sobre la salida CRUDA; se informa además, sin cambiar el
+    umbral, de la salida con la línea corregida por código (``verifiers.correct_review_lines``)."""
     valid, total = _citation_stats(runs)
     rate = valid / total if total else 0.0
     recovered = [e["seeded"]["recovered"] for e in per_rep]
+    recovered_fixed = [e["seeded"].get("recovered_corrected", 0) for e in per_rep]
     fps = [e["clean"]["findings"] for e in per_rep]
     mean_rec = sum(recovered) / len(recovered) if recovered else 0.0
+    mean_fixed = sum(recovered_fixed) / len(recovered_fixed) if recovered_fixed else 0.0
+    fixed_stats = [r.details.get("line_correction") for r in runs if r.details.get("line_correction")]
+    n_findings = sum(len(r.details.get("citations", [])) for r in runs)
+    verifiable = sum(f["verifiable"] for f in fixed_stats)
+    shifted = sum(f["corrected"] for f in fixed_stats)
+    fps_fixed = [e["clean"].get("findings_verifiable", e["clean"]["findings"]) for e in per_rep]
     c = CRITERIA["code_reviewer"]
     return {
-        "metrics": {"valid_citations": valid, "citations": total, "recovered_per_rep": recovered, "false_positives_clean_per_rep": fps, "per_rep": per_rep},
+        "metrics": {
+            "valid_citations": valid, "citations": total, "recovered_per_rep": recovered, "false_positives_clean_per_rep": fps, "per_rep": per_rep,
+            "recovered_corrected_per_rep": recovered_fixed, "recovered_corrected_mean": mean_fixed, "recovered_raw_mean": mean_rec,
+            "findings": n_findings, "findings_verifiable": verifiable, "lines_corrected": shifted, "findings_unverifiable": n_findings - verifiable,
+            "false_positives_clean_corrected_per_rep": fps_fixed,
+        },
         "criteria": [
             ("Defectos sembrados recuperados (media por repetición, de 5)", ">= 3", f"{mean_rec:.2f} {recovered}", mean_rec >= c["recovered_mean_min"]),
             ("Citas válidas (línea existente y cita literal; todas las ejecuciones)", ">= 90 %", f"{100 * rate:.0f} % ({valid}/{total})", total > 0 and rate >= c["valid_citations_min"]),
             ("Falsos positivos en la copia limpia (máximo por repetición)", "<= 2", f"{max(fps) if fps else '-'} {fps}", bool(fps) and max(fps) <= c["false_positives_max"]),
+            # misma medida con la línea corregida por código (informativo; mismo umbral, no sustituye a las anteriores)
+            ("[línea corregida por código] Defectos sembrados recuperados (media por repetición, de 5)", ">= 3", f"{mean_fixed:.2f} {recovered_fixed} ({shifted} líneas corregidas, {n_findings - verifiable} no verificables)", mean_fixed >= c["recovered_mean_min"]),
+            ("[línea corregida por código] Citas verificables (la cita literal está en el fichero)", ">= 90 %", f"{100 * verifiable / n_findings:.0f} % ({verifiable}/{n_findings})" if n_findings else "-", n_findings > 0 and verifiable / n_findings >= c["valid_citations_min"]),
+            ("[línea corregida por código] Falsos positivos en la copia limpia (solo hallazgos verificables; máximo por repetición)", "<= 2", f"{max(fps_fixed) if fps_fixed else '-'} {fps_fixed}", bool(fps_fixed) and max(fps_fixed) <= c["false_positives_max"]),
         ],
     }
 
@@ -724,6 +739,20 @@ def trim_run_info(text: str) -> str:
     for key in RUN_INFO_DROP:
         data.pop(key, None)
     return json.dumps(data, ensure_ascii=False, separators=(", ", ": "))
+
+
+def summary_corrected_metrics(report: str, source: str, max_words: int | None = None) -> dict:
+    """Métricas del resumen tras la corrección por código (coma decimal y recorte a ``max_words``, por defecto el criterio)."""
+    limit = max_words or CRITERIA["summarizer"]["max_words"]
+    fixed, info = postprocess_summary(report, source, limit)
+    return {
+        "text": fixed,
+        "mode": info["mode"],
+        "words": count_words(fixed),
+        "numbers": info["numbers_after"],
+        "numbers_raw": info["numbers_before"],
+        "spanish": spanish_score(fixed),
+    }
 
 
 def eval_summarizer(args, rec: Recorder, work: Path, results: Path) -> dict:
@@ -752,20 +781,43 @@ def eval_summarizer(args, rec: Recorder, work: Path, results: Path) -> dict:
             if not verification:
                 notes += f" sin resumen (parada {result.stop_reason})"
             details = {"case": case, "words": d.get("words"), "numbers": d.get("numbers"), "spanish": d.get("spanish"), "input_chars": len(context["source"])}
+            if verification:  # salida CORREGIDA por código (coma decimal y recorte); la cruda es la que juzgan los criterios
+                details["corrected"] = summary_corrected_metrics(result.report, context["source"])
+                fixed = details["corrected"]
+                notes += f" | corregido: palabras={fixed['words']} cifras={fixed['numbers']['supported']}/{fixed['numbers']['total']} castellano={fixed['spanish']['ratio']:.2f} recorte={fixed['mode']}"
             rec.add(_system_record("summarizer", case, rep, result, root, before, args.env_variant, ok, notes, details, None))
-    runs = rec.runs
+    return _summarizer_summary(rec.runs)
+
+
+def _summarizer_summary(runs: list[RunRecord]) -> dict:
+    """Resumen del resumidor: los criterios (fijados) se juzgan sobre el resumen CRUDO; se informa además, sin cambiar el
+    umbral, del resumen corregido por código (coma decimal y recorte a ``max_words``)."""
     total = sum((r.details.get("numbers") or {}).get("total", 0) for r in runs)
     supported = sum((r.details.get("numbers") or {}).get("supported", 0) for r in runs)
     ratio = supported / total if total else 0.0
     words = [r.details.get("words") for r in runs]
     words_ok = bool(runs) and all(isinstance(w, int) and 0 < w <= CRITERIA["summarizer"]["max_words"] for w in words)
     spanish_ok = bool(runs) and all((r.details.get("spanish") or {}).get("is_spanish") for r in runs)
+    fixed = [r.details["corrected"] for r in runs if r.details.get("corrected")]
+    fixed_total = sum(f["numbers"]["total"] for f in fixed)
+    fixed_supported = sum(f["numbers"]["supported"] for f in fixed)
+    fixed_ratio = fixed_supported / fixed_total if fixed_total else 0.0
+    fixed_words = [f["words"] for f in fixed]
+    fixed_words_ok = bool(fixed) and all(0 < w <= CRITERIA["summarizer"]["max_words"] for w in fixed_words)
+    fixed_spanish_ok = bool(fixed) and all(f["spanish"]["is_spanish"] for f in fixed)
     return {
-        "metrics": {"numbers_supported": supported, "numbers_total": total, "words": words},
+        "metrics": {
+            "numbers_supported": supported, "numbers_total": total, "words": words,
+            "corrected": {"numbers_supported": fixed_supported, "numbers_total": fixed_total, "words": fixed_words, "modes": [f["mode"] for f in fixed]},
+        },
         "criteria": [
             ("Cifras del resumen presentes en la entrada (agregado)", ">= 95 %", f"{100 * ratio:.1f} % ({supported}/{total})", total > 0 and ratio >= CRITERIA["summarizer"]["numbers_min"]),
             ("Palabras por resumen (todas las ejecuciones)", "<= 150", f"máx. {max((w for w in words if isinstance(w, int)), default='-')} {words}", words_ok),
             ("En castellano (todas las ejecuciones)", "proporción >= 0,8", "; ".join(f"{(r.details.get('spanish') or {}).get('ratio', 0):.2f}" for r in runs), spanish_ok),
+            # misma medida sobre el resumen corregido por código (informativo; mismo umbral, no sustituye a las anteriores)
+            ("[corregido por código] Cifras del resumen presentes en la entrada (agregado)", ">= 95 %", f"{100 * fixed_ratio:.1f} % ({fixed_supported}/{fixed_total})", fixed_total > 0 and fixed_ratio >= CRITERIA["summarizer"]["numbers_min"]),
+            ("[corregido por código] Palabras por resumen (todas las ejecuciones)", "<= 150", f"máx. {max(fixed_words, default='-')} {fixed_words}", fixed_words_ok),
+            ("[corregido por código] En castellano (todas las ejecuciones)", "proporción >= 0,8", "; ".join(f"{f['spanish']['ratio']:.2f}" for f in fixed), fixed_spanish_ok),
         ],
     }
 
@@ -814,7 +866,7 @@ def eval_retriever(args, rec: Recorder, work: Path, results: Path) -> dict:
         index_file.unlink()
     t0 = time.monotonic()
     before_index = snapshot(root)
-    first = retrieve(queries[0][0], root=root, k=3, build=True)  # construye y guarda el índice
+    first = retrieve(queries[0][0], root=root, k=3, lexical=False, build=True)  # construye y guarda el índice
     build_s = time.monotonic() - t0
     ps = ollama_ps(config.base_url, config.model)
     size_kb = round(index_file.stat().st_size / 1024) if index_file.exists() else None
@@ -824,7 +876,7 @@ def eval_retriever(args, rec: Recorder, work: Path, results: Path) -> dict:
     per_query = []
     for number, (query, truth) in enumerate(queries):
         t1 = time.monotonic()
-        emb_hits = first if number == 0 else retrieve(query, root=root, k=3)
+        emb_hits = first if number == 0 else retrieve(query, root=root, k=3, lexical=False)
         emb_s = time.monotonic() - t1
         lex_hits = [h.as_dict() for h in lexical.search(query, 3)]
         r_emb, r_lex = retriever_rank(emb_hits, truth), retriever_rank(lex_hits, truth)
@@ -951,7 +1003,7 @@ def build_report(results_dir: Path) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m amp_agents.eval_roles", description="Evaluación en vivo de los roles (no es un test de pytest).")
-    parser.add_argument("command", choices=[*ROLES, "all", "report"])
+    parser.add_argument("command", choices=[*ALL_ROLES, "all", "report"])
     parser.add_argument("--workdir", default=str(DEFAULT_WORKDIR), help="carpeta (fuera del repositorio) para las copias")
     parser.add_argument("--results-dir", dest="results_dir", help="carpeta de resultados (por defecto <workdir>/results)")
     parser.add_argument("--env-variant", dest="env_variant", type=int, default=1, help="variante de la sección «Entorno de ejecución» del prompt")
@@ -959,7 +1011,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reps", type=int, help="solo para pruebas rápidas: sustituye las repeticiones del protocolo")
     parser.add_argument("--limit", type=int, help="solo para pruebas rápidas: primeros N casos")
     parser.add_argument("--drop", action="append", help="solo diagnóstico del retriever: quita de la copia los ficheros que cumplan este patrón (repetible)")
-    parser.add_argument("--roles", default=",".join(ROLES), help="con 'all': roles separados por comas, en orden")
+    parser.add_argument("--roles", default=",".join(ROLES), help="con 'all': roles separados por comas, en orden (por defecto sin el localizador, retirado; añádelo con --roles locator,...)")
     parser.add_argument("--deadline-min", dest="deadline_min", type=float, help="con 'all': no empezar otro rol pasado este tiempo")
     args = parser.parse_args(argv)
     args.results_dir = args.results_dir or str(Path(args.workdir) / "results")
@@ -972,7 +1024,11 @@ def main(argv: list[str] | None = None) -> int:
         evaluate_role(args.command, args)
         return 0
     started = time.monotonic()
-    for role in [r.strip() for r in args.roles.split(",") if r.strip()]:
+    requested = [r.strip() for r in args.roles.split(",") if r.strip()]
+    unknown = [r for r in requested if r not in ALL_ROLES]
+    if unknown:
+        parser.error(f"roles desconocidos: {unknown}; disponibles: {list(ALL_ROLES)}")
+    for role in requested:
         if args.deadline_min and (time.monotonic() - started) / 60 > args.deadline_min:
             print(f"== presupuesto agotado: se omite {role} y los siguientes", file=sys.stderr, flush=True)
             break

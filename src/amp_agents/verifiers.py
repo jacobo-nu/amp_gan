@@ -173,19 +173,23 @@ def read_project_text(root: str | Path, ruta: str) -> str | None:
         return None
 
 
-def find_quote(text: str, quote: str) -> tuple[int, int] | None:
-    """Líneas ``(primera, última)`` (desde 1) donde aparece la cita literal en ``text``; ``None`` si no aparece.
+def find_quote_occurrences(text: str, quote: str) -> list[tuple[int, int]]:
+    """Todas las apariciones de la cita literal en ``text``, como líneas ``(primera, última)`` (desde 1), en orden.
 
-    Se busca el fragmento tal cual (sin espacios en los extremos); si no está, se compara con los espacios en
-    blanco colapsados.
+    Se busca el fragmento tal cual (sin espacios en los extremos); si no está en ninguna parte, se buscan las
+    apariciones con los espacios en blanco colapsados. Lista vacía si la cita está vacía o no aparece.
     """
     wanted = (quote or "").strip()
     if not wanted:
-        return None
+        return []
+    found: list[tuple[int, int]] = []
     index = text.find(wanted)
-    if index >= 0:
+    while index >= 0:
         first = text.count("\n", 0, index) + 1
-        return first, first + wanted.count("\n")
+        found.append((first, first + wanted.count("\n")))
+        index = text.find(wanted, index + 1)
+    if found:
+        return found
     collapsed: list[str] = []
     line_of: list[int] = []
     line = 1
@@ -205,9 +209,20 @@ def find_quote(text: str, quote: str) -> tuple[int, int] | None:
     norm_text = "".join(collapsed)
     norm_quote = " ".join(wanted.split())
     index = norm_text.find(norm_quote)
-    if index < 0:
-        return None
-    return line_of[index], line_of[index + len(norm_quote) - 1]
+    while index >= 0:
+        found.append((line_of[index], line_of[index + len(norm_quote) - 1]))
+        index = norm_text.find(norm_quote, index + 1)
+    return found
+
+
+def find_quote(text: str, quote: str) -> tuple[int, int] | None:
+    """Líneas ``(primera, última)`` (desde 1) donde aparece por primera vez la cita literal en ``text``; ``None`` si no.
+
+    Se busca el fragmento tal cual (sin espacios en los extremos); si no está, se compara con los espacios en
+    blanco colapsados.
+    """
+    found = find_quote_occurrences(text, quote)
+    return found[0] if found else None
 
 
 def count_lines(text: str) -> int:
@@ -291,6 +306,71 @@ def check_review_citations(obj: Any, source: str) -> list[dict]:
             }
         )
     return out
+
+
+def _distance_to_span(line: int, span: tuple[int, int]) -> int:
+    first, last = span
+    return 0 if first <= line <= last else min(abs(line - first), abs(line - last))
+
+
+def correct_review_lines(obj: Any, source: str) -> dict:
+    """Corrige por código la línea de cada hallazgo del revisor buscando su cita literal en ``source``.
+
+    El modelo suele acertar el texto de la línea pero desplazar el número. Para cada hallazgo con cita:
+
+    - si la cita aparece en el fichero, ``linea`` pasa a ser la primera línea de la aparición más cercana a la línea
+      que dio el modelo (a igual distancia, la primera; también si esa línea cae fuera del fichero); si el modelo ya cae
+      dentro de esa aparición no se toca. Si la línea del modelo no es un entero se usa la primera aparición;
+    - si la cita no aparece (ni colapsando espacios), el hallazgo se marca ``verificable = False`` y NO se inventa
+      ninguna línea: conserva la del modelo.
+
+    Devuelve ``{"obj", "items", "verifiable", "corrected", "unverifiable"}``: ``obj`` es una copia del objeto con
+    ``linea`` corregida y las claves ``verificable`` (y ``linea_modelo`` si cambió); ``items`` informa, por hallazgo,
+    de ``linea_modelo``, ``linea``, ``estado`` (``"igual"``, ``"corregida"`` o ``"no_verificable"``) y ``apariciones``.
+    No modifica la entrada.
+    """
+    raw = obj.get("hallazgos", []) if isinstance(obj, dict) else []
+    out_findings: list[Any] = []
+    items = []
+    for index, finding in enumerate(raw):
+        if not isinstance(finding, dict):
+            out_findings.append(finding)
+            continue
+        linea, cita = finding.get("linea"), finding.get("cita")
+        spans = find_quote_occurrences(source, cita) if isinstance(cita, str) else []
+        fixed = dict(finding)
+        if not spans:
+            fixed["verificable"] = False
+            state, new_line = "no_verificable", linea
+        else:
+            if _is_int(linea):
+                best = min(spans, key=lambda span: (_distance_to_span(linea, span), span[0]))
+                new_line = linea if best[0] <= linea <= best[1] else best[0]
+            else:
+                new_line = spans[0][0]
+            fixed["verificable"] = True
+            if new_line != linea:
+                fixed["linea_modelo"] = linea
+                fixed["linea"] = new_line
+            state = "igual" if new_line == linea else "corregida"
+        out_findings.append(fixed)
+        items.append({"item": index, "linea_modelo": linea, "linea": new_line, "estado": state, "apariciones": len(spans)})
+    corrected = dict(obj) if isinstance(obj, dict) else {}
+    corrected["hallazgos"] = out_findings
+    return {
+        "obj": corrected,
+        "items": items,
+        "verifiable": sum(i["estado"] != "no_verificable" for i in items),
+        "corrected": sum(i["estado"] == "corregida" for i in items),
+        "unverifiable": sum(i["estado"] == "no_verificable" for i in items),
+    }
+
+
+def verifiable_findings(corrected_obj: Any) -> dict:
+    """Copia de un objeto ya corregido con solo los hallazgos ``verificable`` (los demás no se pueden comprobar)."""
+    findings = corrected_obj.get("hallazgos", []) if isinstance(corrected_obj, dict) else []
+    kept = [f for f in findings if isinstance(f, dict) and f.get("verificable") is True]
+    return {**corrected_obj, "hallazgos": kept} if isinstance(corrected_obj, dict) else {"hallazgos": kept}
 
 
 # -- cifras, palabras e idioma ---------------------------------------------------------------------------
@@ -388,6 +468,132 @@ def spanish_score(text: str) -> dict:
     return {"es": es, "en": en, "ratio": ratio, "is_spanish": ratio >= SPANISH_MIN_RATIO and es >= SPANISH_MIN_HITS}
 
 
+# -- correcciones por código del resumen -----------------------------------------------------------------------
+_SENTENCE_END_RE = re.compile(r"[.?!…][)\]»\"”’']*$")
+_ABBREVIATIONS = frozenset("p. ej. aprox. fig. vs. núm. sr. sra. dr. dra. ca. cf. pág. págs. ud. uds.".split())
+_LIST_MARKER_TOKEN_RE = re.compile(r"\d+[.)]$")
+
+
+def _is_sentence_end(index: int, tokens: list[re.Match]) -> bool:
+    """¿Termina una frase en el trozo ``index``? No cuenta un punto de abreviatura («p. ej.») ni un marcador de lista
+    («1.» al principio de línea o tras otra frase); sí cuenta un número al final de frase («época 200.»)."""
+    match = tokens[index]
+    text = match.group(0).strip("*_(\"“«")
+    if not _SENTENCE_END_RE.search(text):
+        return False
+    if text.lower() in _ABBREVIATIONS or (len(text) == 2 and text[0].isalpha() and text[1] == "."):
+        return False
+    if _LIST_MARKER_TOKEN_RE.fullmatch(text):
+        line_before = match.string[: match.start()].rsplit("\n", 1)[-1].strip()
+        return bool(line_before) and not _SENTENCE_END_RE.search(line_before)  # «… tres. 2.»: «2.» es otro marcador
+    return True
+
+
+def trim_summary_with_mode(text: str, max_words: int = 150) -> tuple[str, str]:
+    """Recorta ``text`` a ``max_words`` palabras (las que cuenta :func:`count_words`) y dice cómo: ``(texto, modo)``.
+
+    ``modo`` es ``"intacto"`` (ya cabía; se devuelve igual), ``"frase"`` (se corta en el último final de frase
+    —``.``, ``?``, ``!`` o ``…`` seguido de espacio o del final— que cabe) o ``"palabras"`` (ninguna frase cabe: se
+    corta tras la palabra ``max_words`` y se quitan los separadores sueltos del final). Nunca se parte una cifra:
+    un decimal («0,43») es un único trozo, un millar con espacio («21 754») no se separa y un ``%`` suelto se
+    conserva junto a su cifra. Se conservan los saltos de párrafo del texto original.
+    """
+    if max_words < 1:
+        raise ValueError("max_words debe ser >= 1")
+    body = text or ""
+    if count_words(body) <= max_words:
+        return body, "intacto"
+    tokens = list(re.finditer(r"\S+", body))
+    counted = 0
+    last_sentence_end = None  # índice del trozo con el que acaba la última frase completa que cabe
+    cut = len(tokens) - 1
+    for i, match in enumerate(tokens):
+        if any(c.isalnum() for c in match.group(0)):
+            counted += 1
+        if counted > max_words:
+            cut = i - 1
+            break
+        if _is_sentence_end(i, tokens):
+            last_sentence_end = i
+    if last_sentence_end is not None:
+        end = tokens[last_sentence_end].end()
+        return body[:end].rstrip(), "frase"
+    # ninguna frase cabe: por palabras, sin partir cifras
+    while cut > 0 and re.fullmatch(r"\d+", tokens[cut].group(0)) and cut + 1 < len(tokens) and re.match(r"\d{3}(?:\D|$)", tokens[cut + 1].group(0)):
+        cut -= 1
+    if cut + 1 < len(tokens) and tokens[cut + 1].group(0) == "%" and re.search(r"\d$", tokens[cut].group(0)):
+        cut += 1
+    trimmed = body[: tokens[cut].end()].rstrip()
+    trimmed = trimmed.rstrip(" ,;:—–-(¿¡\"«“")
+    return trimmed, "palabras"
+
+
+def trim_summary(text: str, max_words: int = 150) -> str:
+    """Recorta un resumen a ``max_words`` palabras (ver :func:`trim_summary_with_mode`)."""
+    return trim_summary_with_mode(text, max_words)[0]
+
+
+_DOT_DECIMAL_RE = re.compile(r"(?<![\w.,/\\:@#~])(-?)(\d+)\.(\d+)(?!\w|\.\w|,\d|[/\\])")
+_THOUSANDS_LIKE_RE = re.compile(r"[1-9]\d{0,2}\.\d{3}")
+_CODE_SPAN_RE = re.compile(r"(`[^`\n]*`|https?://\S+)")
+
+
+def _thousands_reading(token: str, reference: list[Number]) -> str:
+    """Cómo leer un número ambiguo con punto y tres cifras tras él (``2.609``) según la entrada: ``"decimal"``,
+    ``"millar"`` o ``"ambiguo"`` (las dos lecturas están respaldadas o ninguna lo está)."""
+    as_decimal = number_supported(Number(token, (float(token),), 3, False), reference)
+    as_thousands = number_supported(Number(token, (float(token.replace(".", "")),), 0, False), reference)
+    if as_decimal and not as_thousands:
+        return "decimal"
+    if as_thousands and not as_decimal:
+        return "millar"
+    return "ambiguo"
+
+
+def decimal_comma(text: str, source: str | None = None) -> str:
+    """Pasa el punto decimal a coma decimal en un texto en castellano sin tocar rutas, ficheros ni identificadores.
+
+    Solo cambia un número AISLADO con punto (``0.9`` -> ``0,9``; ``-0.5`` -> ``-0,5``; ``37.5%`` -> ``37,5%``). No toca
+    lo que va entre comillas invertidas ni las URL, ni lo pegado a letras, guiones bajos o barras (``v1.2``,
+    ``run_0.9.csv``, ``src/a/1.5.py``), ni versiones o fechas (``1.2.3``, ``2026.11.05``), ni los números con coma
+    (``1,5``). Un número que puede ser un millar con punto (``21.754``, ``2.609``: de una a tres cifras, punto y
+    exactamente tres cifras) es ambiguo y se deja como está, salvo que se pase la entrada ``source`` y solo la lectura
+    decimal esté respaldada por ella (``2.609`` con ``2.6094`` en la entrada); con la lectura de millar o con las dos
+    (o ninguna) respaldadas se deja. Idempotente.
+    """
+    reference = (extract_numbers(source) + extract_numbers(source, comma_decimal=False)) if source else []
+
+    def swap(match: re.Match) -> str:
+        sign, whole, frac = match.groups()
+        start = match.start()
+        if not sign and start > 1 and match.string[start - 1] == "-" and (match.string[start - 2].isalpha() or match.string[start - 2] == "_"):
+            return match.group(0)  # «run-0.9»: el guion es parte de un nombre
+        token = f"{whole}.{frac}"
+        if _THOUSANDS_LIKE_RE.fullmatch(token) and not (source and _thousands_reading(token, reference) == "decimal"):
+            return match.group(0)
+        return f"{sign}{whole},{frac}"
+
+    parts = _CODE_SPAN_RE.split(text or "")
+    return "".join(part if i % 2 else _DOT_DECIMAL_RE.sub(swap, part) for i, part in enumerate(parts))
+
+
+def postprocess_summary(text: str, source: str | None = None, max_words: int = 150) -> tuple[str, dict]:
+    """Corrección por código de un resumen: coma decimal y recorte a ``max_words``. Devuelve ``(texto, info)``.
+
+    ``info``: ``mode`` del recorte (``intacto``/``frase``/``palabras``), ``words_before`` y ``words_after``, y, con
+    ``source``, las cifras respaldadas antes y después (``numbers_before``/``numbers_after``). El recorte va primero
+    sobre el texto ya con coma decimal; las cifras se comparan con la entrada con :func:`check_numbers_supported`,
+    que admite coma o punto decimal en el resumen.
+    """
+    commas = decimal_comma(text, source)
+    fixed, mode = trim_summary_with_mode(commas, max_words)
+    info: dict = {"mode": mode, "words_before": count_words(text), "words_after": count_words(fixed)}
+    if source is not None:
+        info["numbers_before"] = check_numbers_supported(text, source)
+        info["numbers_after"] = check_numbers_supported(fixed, source)
+    return fixed, info
+
+
 # -- recuperación ---------------------------------------------------------------------------------------
 def retrieval_rank(results: Sequence[dict], expected_files: str | Sequence[str], keyword: str, k: int = 3) -> int | None:
     """Posición (desde 1) del primer resultado, entre los ``k`` primeros, de un fichero esperado cuyo texto contiene
@@ -463,6 +669,8 @@ def verify_code_reviewer(text: str, root: str | Path | None = None, source: str 
         checks = check_review_citations(obj, source)
         details["citations"] = checks
         errors += [f"cita o línea no válida en el hallazgo {c['item']} (línea {c['linea']})" for c in checks if not c["valid"]]
+        # la validez (``valid``) se juzga sobre la salida CRUDA; la corrección de línea es un paso aparte e informativo
+        details["line_correction"] = correct_review_lines(obj, source)
     return Verification(not errors, errors, details)
 
 

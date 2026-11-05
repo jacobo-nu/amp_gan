@@ -7,7 +7,8 @@ Piezas (solo biblioteca estándar; los embeddings los calcula un proveedor exter
 - :func:`build_index` / :func:`save_index` / :func:`load_index`: índice en JSON (por defecto en
   ``.agent_runs/index/index.json``, fuera del control de versiones).
 - :class:`EmbeddingRetriever`: similitud coseno en Python puro entre la consulta y los fragmentos.
-- :class:`LexicalRetriever`: línea base léxica (BM25 simple, sin modelo) con la misma interfaz.
+- :class:`LexicalRetriever`: BM25 estándar (``k1=1,5``, ``b=0,75``, sin modelo) con la misma interfaz. Es el recuperador
+  POR DEFECTO (``search_backend = "lexical"``); los embeddings son una opción explícita.
 - :func:`search_docs_tool`: herramienta ``search_docs(query, k=3)`` de solo lectura para otros roles.
 
 Los modelos ``nomic-embed-text`` esperan un prefijo de tarea: ``search_document: `` en los fragmentos y
@@ -284,7 +285,12 @@ def tokenize(text: str) -> list[str]:
 
 
 class LexicalRetriever(Retriever):
-    """Línea base léxica: BM25 (``k1=1,5``, ``b=0,75``) sobre las palabras de los fragmentos y de la ruta."""
+    """Recuperador léxico por defecto: BM25 Okapi (``k1=1,5``, ``b=0,75``) sobre las palabras de los fragmentos y de la ruta.
+
+    Puntuación de un fragmento ``d`` para los términos distintos ``t`` de la consulta (sin palabras vacías):
+    ``sum_t idf(t) * f(t,d) * (k1 + 1) / (f(t,d) + k1 * (1 - b + b * |d| / avgdl))`` con
+    ``idf(t) = ln(1 + (N - n_t + 0,5) / (n_t + 0,5))`` (la variante no negativa de Lucene).
+    """
 
     name = "lexical"
 

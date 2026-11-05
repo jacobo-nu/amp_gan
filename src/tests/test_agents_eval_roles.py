@@ -36,7 +36,8 @@ def test_declared_criteria_match_the_protocol():
         "retriever": {"top3_min": 0.80},
     }
     assert E.REPS == {"locator": 2, "doc_checker": 3, "code_reviewer": 3, "summarizer": 3}
-    assert E.ROLES == ("locator", "doc_checker", "code_reviewer", "summarizer", "retriever")
+    assert E.ROLES == ("doc_checker", "code_reviewer", "summarizer", "retriever")  # el localizador está retirado de `all`
+    assert E.ALL_ROLES == ("locator", "doc_checker", "code_reviewer", "summarizer", "retriever")
 
 
 # -- siembra de incoherencias documentales ------------------------------------------------------------------------------
