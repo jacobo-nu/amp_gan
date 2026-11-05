@@ -1,6 +1,6 @@
 # Agente: Ejecutor
 
-**Implementación**: subagente de Claude Code (a definir en `.claude/agents/executor.md`).
+**Implementación**: agente ejecutor intercambiable. Subagente definido en `.claude/agents/executor.md` o agente propio con un modelo local (`src/amp_agents/`, configurado en `src/amp_agents/agents.toml`); ambos usan esta misma definición.
 
 ## Responsabilidades
 - Implementar la tarea recibida en `src/`.
