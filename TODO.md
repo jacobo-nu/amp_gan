@@ -2,13 +2,13 @@
 
 Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](context/constitution/roadmap.md).
 
-## Estado para retomar (2026-11-05 18:07 CET)
-- **Git:** todo el trabajo está fusionado en `main` (ff-only) salvo lo que se indique. El último `git push origin main` del usuario falló a las 16:00 UTC con `remote: Internal Server Error` de GitHub (fallo del servidor, el repositorio local pasa `git fsck`); hay que **reintentar `git push origin main`**. No cambiar de rama desde VS Code mientras trabaja un ejecutor.
-- **Hecho en Fase 3:** WGAN-GP (notebook 03), condicional por longitud (04, criterios A y B cumplidos), condicional por hidrofobicidad (05: criterio A cumplido con el A.2 revisado después de ver el resultado, B no cumplido) y agente ejecutor con modelo local (`src/amp_agents/`), más cinco roles locales evaluados (ver abajo). 541 tests.
+## Estado para retomar (actualizado 2026-11-06)
+- **Git:** todo el trabajo está fusionado en `main` (ff-only) salvo lo que se indique. El push a `origin/main` está al día (2026-11-06). No cambiar de rama desde VS Code mientras trabaja un ejecutor.
+- **Fase 3 (GAN) cerrada por decisión del usuario el 2026-11-06: no se prueban más variantes.** Hecho en Fase 3: WGAN-GP (notebook 03), condicional por longitud (04, criterios A y B cumplidos), condicional por hidrofobicidad (05: criterio A cumplido con el A.2 revisado después de ver el resultado, B no cumplido) y agente ejecutor con modelo local (`src/amp_agents/`), más cinco roles locales evaluados (ver abajo). 541 tests.
 - **Modelos en Ollama** (los tres grandes anteriores se borraron el 2026-11-05): `qwen3:4b` (ejecutor, herramientas), `llama3.2:3b` (herramientas), `phi4-mini` (herramientas), `qwen2.5-coder:7b` (herramientas; se pasa un 9 % a CPU en la GPU de 6 GB), `gemma3:4b` (sin herramientas), `nomic-embed-text` (embeddings).
 
 ## Roles locales: segunda iteración hecha y fusionada en `main` (2026-11-06)
-Rama `feat/local-roles-2` (3 commits, 638 tests), fusionada con `--ff-only`; falta el `git push origin main` del usuario. Resultados en el roadmap: ningún rol cumple todos sus criterios. Decisiones ya aplicadas: localizador retirado (`amp_agents.locate`), BM25 por defecto, corrección de línea y recorte por código, `doc_checker_ss` creado y evaluado (no cumple nada), `DATA_NOTICE` limpiado.
+Rama `feat/local-roles-2` (3 commits, 638 tests), fusionada con `--ff-only` y publicada (push hecho el 2026-11-06). Resultados en el roadmap: ningún rol cumple todos sus criterios. Decisiones ya aplicadas: localizador retirado (`amp_agents.locate`), BM25 por defecto, corrección de línea y recorte por código, `doc_checker_ss` creado y evaluado (no cumple nada), `DATA_NOTICE` limpiado.
 - [ ] **Decidir** qué hacer con `doc_checker`/`doc_checker_ss` (phi4-mini no sirve para esto): retirarlo, o probar un modelo distinto en una pasada (p. ej. `gemma3:4b`, que ya está descargado; ojo con el contexto: los dos documentos son unos 5 600 tokens)
 - [ ] **Decidir** sobre el resumidor: dejarlo con recorte por código (cumple palabras e idioma; cifras 94,3 % frente a 95 %) o añadir un paso que quite las frases con cifras no respaldadas
 - [ ] **Decidir** sobre el revisor de código (1,2 de 5 defectos): ¿se mantiene solo como apoyo con comprobación humana, o se retira?
@@ -17,9 +17,8 @@ Rama `feat/local-roles-2` (3 commits, 638 tests), fusionada con `--ff-only`; fal
 - [ ] Decidir si el verificador de citas debe aceptar `ruta#línea` (alguna respuesta del modelo lo usa); cambiarlo después de ver resultados exigiría declararlo igual que el A.2 de hidrofobicidad
 
 ## Ahora
-- [ ] Fase 3, GAN condicional por longitud e hidrofobicidad a la vez (percentiles 10–90). Plan: conservar los criterios de longitud, usar el A.2 revisado (`conditions.mae_vs_reference`) para las dos propiedades y fijar todos los criterios antes de entrenar; comparar con las dos condicionales y con la referencia `gan_stabc`
-- [ ] Notebook nuevo: la condicional por ambas y la comparación final de variantes (los notebooks 03 WGAN-GP, 04 longitud y 05 hidrofobicidad ya están hechos, uno por experimento)
-- [ ] Trabajo de entrega (`entregas/primer_trabajo/Primer_Trabajo_Biofísica.ipynb`, fuera de git): el usuario lo revisa a mano; límite 2026-11-14, objetivo entregar esta semana; pulidos pendientes: minúscula tras «Qué se observa.», separador de miles, «Siguientes pasos» menciona cosas ya hechas, tiempo en CPU solo estimado
+- [ ] **Notebook de entrega** (`entregas/primer_trabajo/Primer_Trabajo_Biofísica.ipynb`, fuera de git; límite 2026-11-14): reescribirlo condensado, **máximo 90 celdas**, con el selector de backend, la GAN básica y sus correcciones, la WGAN-GP y la condicional por longitud, todo bien explicado. En curso: construcción (copia de seguridad `.copia-2026-11-06.ipynb`); después, ejecución completa con salidas y revisión del usuario. Pulidos incluidos: minúscula tras «Qué se observa.», separador de miles, «Siguientes pasos» sin lo ya hecho, tiempo en CPU declarado como estimación
+- [ ] **Modelos locales:** probar cuáles sirven para integrarlos como roles y dejar la arquitectura lista para futuros proyectos. Rama `feat/model-trials` (opción `--model` en `eval_roles`; prueba de `gemma3:4b` como verificador de coherencia en curso). Candidatos que caben en 6 GB: `deepseek-r1:7b` (descargado), `tev1:4b`, `lfm3:1.7b` y `bonsai-2:9b` (**no descargados: piden una versión de Ollama más reciente; actualizar Ollama lo hace el usuario**). Kimi descartado (solo existe en la nube)
 
 ## Siguiente (Fase 1 — Datos)
 - [ ] Escribir el script de descarga reproducible en `src/amp_gan/`
@@ -27,7 +26,6 @@ Rama `feat/local-roles-2` (3 commits, 638 tests), fusionada con `--ff-only`; fal
 ## Entrega del trabajo
 - [x] **Selección de backend según la máquina de quien ejecute el código** (hecho 4-nov-2026, `feat/backend-adaptativo`). CPU por defecto (`runtime.apply_cpu_default`: TensorFlow si está instalado, si no torch; `AMP_GAN_BACKEND` lo fuerza); opcionalmente `runtime.apply_auto_backend` / `--auto-backend` / interruptor `EVALUAR_BACKEND` del notebook 02 miden los candidatos disponibles y aplican el más rápido; sin GPU utilizable no mide y usa la CPU. Ningún script lee ya `benchmark_results.csv`. Comprobado: 184 tests (también con la GPU oculta y sin el CSV) y el notebook 02 completo en CPU sin errores.
   - Tiempo en CPU medido en esta máquina: 3,9–4,4 s/época por modelo y **57 min** el notebook 02 completo (tres modelos); con GPU y la celda opcional, ~23 min. Pendiente: documentarlo en el README.
-  - Pendiente: las WGAN-GP necesitará una penalización de gradiente por backend (TensorFlow en CPU por defecto, torch en GPU).
   - Los `*_run_info.json` ya generados conservan la clave antigua `benchmark_decision`; los nuevos usan `backend_mode` y `backend_decision`.
 
 ## Pendiente de decidir
