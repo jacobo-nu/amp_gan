@@ -23,7 +23,7 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from .providers import DEFAULT_OLLAMA_URL, ChatProvider, OllamaProvider, OpenAICompatProvider
+from .providers import DEFAULT_OLLAMA_URL, ChatProvider, OllamaProvider, OpenAICompatProvider, SystemOneProvider
 from .retrieval import DEFAULT_INDEX_DIR, search_docs_tool
 from .tools import ALL_TOOLS, Policy, Tool, build_tools
 
@@ -33,7 +33,7 @@ PROJECT_ROOT = PACKAGE_DIR.parents[1]
 
 # "ollama" usa la API nativa de Ollama (permite fijar num_ctx); el resto, la API compatible con OpenAI.
 OPENAI_COMPAT_PROVIDERS = ("ollama_openai", "openai_compat", "llamacpp", "vllm")
-PROVIDER_NAMES = ("ollama",) + OPENAI_COMPAT_PROVIDERS
+PROVIDER_NAMES = ("ollama", "ollama_systemone") + OPENAI_COMPAT_PROVIDERS  # ollama_systemone: modelos de decisión (no generan texto)
 MODES = ("agent", "single_shot", "embedding")
 WRITE_TOOLS = ("write_file", "edit_file")
 EXTRA_TOOLS = ("search_docs",)  # herramientas que no están en tools.ALL_TOOLS (se construyen con la configuración)
@@ -304,6 +304,8 @@ def make_provider(config: AgentConfig) -> ChatProvider:
     """
     if config.provider not in PROVIDER_NAMES:
         raise ConfigError(f"proveedor {config.provider!r} desconocido; disponibles: {list(PROVIDER_NAMES)}")
+    if config.provider == "ollama_systemone":  # modelo de decisión: sin tokens que limitar, solo tope de tiempo
+        return SystemOneProvider(base_url=config.base_url, model=config.model, timeout=config.timeout, options=config.options)
     if config.provider == "ollama":
         native = dict(config.options)
         if config.max_tokens:

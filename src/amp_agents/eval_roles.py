@@ -5,6 +5,7 @@ Uso (desde la carpeta ``src``, con Ollama en marcha y los modelos descargados)::
     python -m amp_agents.eval_roles locator       --workdir /ruta/a/carpeta/vacia   # RETIRADO: solo para reproducir el resultado
     python -m amp_agents.eval_roles doc_checker   --workdir ...
     python -m amp_agents.eval_roles doc_checker_ss --workdir ...   # variante de una pasada de doc_checker (mismo protocolo y criterios)
+    python -m amp_agents.eval_roles doc_checker_pairs --model gemma3:4b --reps 5 --workdir ...   # verificador acotado: el código da pares de líneas, el modelo juzga sí/no
     python -m amp_agents.eval_roles code_reviewer --workdir ...
     python -m amp_agents.eval_roles summarizer    --workdir ...
     python -m amp_agents.eval_roles retriever     --workdir ...
@@ -17,7 +18,8 @@ los mismos criterios, sin editar ``agents.toml``: los resultados y las tablas ll
 (``doc_checker_ss@gemma3-4b``) y no pisan los de otros modelos. Funciona con todos los roles (también el recuperador, con un
 modelo de embeddings: ``retriever --model bge-m3``). Antes de empezar se comprueba en ``/api/tags`` que el modelo está
 instalado (no se descarga nada) y se hace una petición de calentamiento, con su propio tope de tiempo, que se registra
-aparte (``warmup`` en el JSON) y no cuenta como repetición. ``--model`` no se admite con ``all``.
+aparte (``warmup`` en el JSON) y no cuenta como repetición. ``--model`` no se admite con ``all``. ``--max-tokens N`` y ``--max-seconds S`` fijan el tope de tokens (razonamiento incluido) y
+el de tiempo de CADA petición del rol evaluado (hacen falta para los modelos de razonamiento).
 
 Todo se hace sobre COPIAS dentro de ``--workdir`` (``context/`` sin ``context/data/`` y ``src/``, sin este script ni
 sus tests, para que las preguntas y sus respuestas no estén en el material consultado): las herramientas y la política
@@ -41,6 +43,12 @@ PROTOCOLO Y CRITERIOS (fijados de antemano; no se ajustan tras ver los resultado
 - doc_checker_ss (``phi4-mini``, modo ``single_shot``): el mismo protocolo, los mismos documentos congelados y LOS MISMOS
   criterios (se leen de la entrada ``doc_checker`` de ``CRITERIA``); solo cambia que no hay herramientas y los dos
   documentos, con numeración de línea, van en el mensaje. Sus resultados se guardan con su propio nombre de rol.
+- doc_checker_pairs (``gemma3:4b`` por defecto, modo ``single_shot``): el mismo protocolo, los mismos documentos y LOS MISMOS
+  criterios (entrada ``doc_checker`` de ``CRITERIA``), pero el modelo solo juzga pares de líneas que genera el código
+  (``amp_agents.pairs``, diseño fijado en su docstring) y las citas de cada hallazgo las pone el código (literales por
+  construcción: el criterio de citas válidas es trivial y no mide al modelo). Además de los tres criterios se informa, en
+  ``pairs_<rol>.json`` y en las notas, de la cobertura del generador sobre las semillas, de los fallos de formato y del
+  tiempo por par. ``--max-minutes`` limita el tiempo (ver ``amp_agents.pairs``).
 - code_reviewer (``qwen2.5-coder:7b``): copia de ``src/amp_gan/properties.py`` con 5 defectos sembrados de tipos
   distintos, más la copia limpia, 3 repeticiones. Un hallazgo cuenta si su línea está a +-2 de la sembrada.
   Criterios: >= 3 de 5 recuperados de media; >= 90 % de citas válidas (existe la línea y la cita es literal);
@@ -81,7 +89,8 @@ from pathlib import Path
 from .agents import PROJECT_ROOT, ConfigError, get_agent_config, make_provider
 from .locate import find_definitions, find_lines  # noqa: F401 (la verdad del localizador; se reexportan)
 from .loop import AgentResult
-from .providers import ProviderError
+from .pairs import SENSITIVITY_THRESHOLDS, build_findings, build_pairs, judge_pairs, judgment_stats, pairs_to_json, seed_coverage
+from .providers import ProviderError, Usage
 from .retrieval import LexicalRetriever, chunk_project
 from .run import prepare_task, retrieve, run_task
 from .smoke_live import make_copy as _smoke_copy
@@ -107,7 +116,7 @@ RETIRED_ROLES = ("locator",)
 ALL_ROLES = ("locator", *ROLES)
 # Variantes de un rol: se evalúan con el protocolo y los criterios de su rol base, pero con su propio nombre en los
 # ficheros de resultados. No entran en ``all`` (se piden expresamente, para comparar con el rol base).
-VARIANT_ROLES = {"doc_checker_ss": "doc_checker"}
+VARIANT_ROLES = {"doc_checker_ss": "doc_checker", "doc_checker_pairs": "doc_checker"}
 COMMAND_ROLES = (*ALL_ROLES, *VARIANT_ROLES)
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 DEFAULT_WORKDIR = Path(tempfile.gettempdir()) / "amp_roles_eval"
@@ -150,20 +159,39 @@ def trial_for(role: str, args, config_path=None) -> Trial:
     Sin ninguno de los dos, el nombre es el del rol y no cambia nada. Con ``--model`` el nombre es ``<rol>@<modelo>``
     (``doc_checker_ss@gemma3-4b``), para que los resultados no pisen los de otros modelos. ``--num-ctx`` fija
     ``options.num_ctx`` conservando el resto de opciones del rol; solo (sin ``--model``) añade ``@ctx<N>`` al nombre.
+    ``--max-tokens`` y ``--max-seconds`` cambian los topes de cada petición (``max_tokens``; ``max_seconds`` y ``timeout``) sin
+    cambiar el nombre. ``--think true|false`` fija ``options.think`` (razonamiento de los modelos que lo admiten) y
+    ``--provider`` cambia el proveedor (``ollama_systemone`` para un modelo de decisión); tampoco cambian el nombre.
     """
     model = getattr(args, "model", None) or None
     num_ctx = getattr(args, "num_ctx", None) or None
+    max_tokens = getattr(args, "max_tokens", None) or None
+    max_seconds = getattr(args, "max_seconds", None) or None
+    provider = getattr(args, "provider", None) or None
+    think = getattr(args, "think", None)  # None (sin tocar), True o False
     overrides: dict = {}
     label = role
+    if provider:
+        overrides["provider"] = provider
+    if max_tokens:
+        overrides["max_tokens"] = max_tokens
+    if max_seconds:  # tope de tiempo de cada petición: el del bucle (max_seconds) y el del proveedor (timeout)
+        overrides["max_seconds"] = float(max_seconds)
+        overrides["timeout"] = float(max_seconds)
     if model:
         overrides["model"] = model
         label = f"{role}@{safe_model_name(model)}"
-    if num_ctx:
-        if num_ctx < 256:
-            raise SystemExit("error: --num-ctx debe ser al menos 256")
-        overrides["options"] = {**get_agent_config(role, config_path).options, "num_ctx": num_ctx}
-        if not model:
-            label = f"{role}@ctx{num_ctx}"
+    if num_ctx or think is not None:
+        options = dict(get_agent_config(role, config_path).options)
+        if num_ctx:
+            if num_ctx < 256:
+                raise SystemExit("error: --num-ctx debe ser al menos 256")
+            options["num_ctx"] = num_ctx
+            if not model:
+                label = f"{role}@ctx{num_ctx}"
+        if think is not None:
+            options["think"] = bool(think)  # petición nativa de Ollama: ``think`` va en el primer nivel del cuerpo
+        overrides["options"] = options
     return Trial(label=label, overrides=overrides, model=model)
 
 
@@ -188,6 +216,8 @@ def warm_up(config, provider=None) -> dict:
     try:
         if config.mode == "embedding":
             provider.embed(["calentamiento"], timeout=config.timeout)
+        elif config.provider == "ollama_systemone":  # modelo de decisión: no admite chat
+            provider.decide("Línea A: uno.\nLínea B: dos.", {"calentamiento": "¿Son iguales?"}, timeout=config.timeout)
         else:
             provider.chat([{"role": "user", "content": "Responde solo con la palabra: listo"}], timeout=config.timeout)
     except ProviderError as exc:  # incluye ProviderTimeout
@@ -665,6 +695,189 @@ def _doc_summary(runs: list[RunRecord], per_rep: list[dict]) -> dict:
     }
 
 
+# -- doc_checker_pairs: el código da los pares, el modelo juzga sí/no ------------------------------------------------------
+def _pair_citations(citations: list[dict], positives: list) -> list[dict]:
+    """Pone en las citas verificadas el número de línea REAL del par (``find_quote`` da la primera aparición del texto, que
+    puede ser otra línea si el texto está repetido); la literalidad (``valid``) sigue siendo la del verificador."""
+    out = []
+    for c in citations:
+        c = dict(c)
+        pair = positives[c["item"]]
+        line = pair.line_a if c["side"] == "evidencia_a" else pair.line_b
+        if c["valid"]:
+            c["quote_first_line"] = c["first_line"]
+            c["first_line"] = c["last_line"] = line
+        out.append(c)
+    return out
+
+
+def _match_pairs_directly(positives: list, seeds: list[dict]) -> dict:
+    """``match_doc_findings`` sobre pares positivos con sus líneas reales (citas literales por construcción, sin leer ficheros)."""
+    citations = []
+    for item, pair in enumerate(positives):
+        for side, path, line in (("evidencia_a", pair.path_a, pair.line_a), ("evidencia_b", pair.path_b, pair.line_b)):
+            citations.append({"item": item, "side": side, "ruta": path, "valid": True, "first_line": line, "last_line": line})
+    return match_doc_findings(citations, seeds)
+
+
+def threshold_sensitivity(per_rep_judgments: list[dict], pair_sets: dict, seeds: list[dict], thresholds=SENSITIVITY_THRESHOLDS) -> list[dict]:
+    """Cómo variarían los dos criterios que dependen del modelo con otros umbrales de probabilidad (solo informativo).
+
+    ``per_rep_judgments``: por repetición completa, ``{"seeded": [Judgment...], "clean": [...]}``. Se reutilizan las probabilidades ya
+    guardadas, sin nuevas peticiones, y NO sirve para elegir el umbral con el que se juzgan los criterios (el fijado de antemano).
+    """
+    rows = []
+    for t in thresholds:
+        recovered, fps = [], []
+        for judged in per_rep_judgments:
+            for name, judgments in judged.items():
+                positives = [p for p, j in zip(pair_sets[name].pairs, judgments) if j.score is not None and j.score >= t]
+                if name == "seeded":
+                    recovered.append(len(_match_pairs_directly(positives, seeds)["recovered"]))
+                else:
+                    fps.append(len(positives))
+        rows.append({"threshold": t, "recovered_per_rep": recovered, "recovered_mean": round(sum(recovered) / len(recovered), 2) if recovered else None, "false_positives_clean_per_rep": fps})
+    return rows
+
+
+def rep_fits_budget(elapsed_s: float, last_rep_s: float, budget_s: float | None) -> bool:
+    """¿Cabe otra repetición, que tardará lo que la última, en el presupuesto? Sin presupuesto (``None``) siempre cabe."""
+    return budget_s is None or elapsed_s + last_rep_s <= budget_s
+
+
+def eval_doc_checker_pairs(args, rec: Recorder, work: Path, results: Path, role: str = "doc_checker_pairs") -> dict:
+    """Evalúa el verificador acotado (``amp_agents.pairs``) con el protocolo y los criterios de ``doc_checker``.
+
+    Por repetición y copia (``seeded``, ``clean``): se generan los pares candidatos (siempre los mismos), se pide al modelo
+    un juicio por par, el código construye los hallazgos con citas literales y se puntúa igual que ``eval_doc_checker``.
+    ``--max-minutes`` es un presupuesto de tiempo (ver ``amp_agents.pairs``); sin él se hacen todas las repeticiones.
+    """
+    trial = trial_for(role, args)
+    roadmap_text, todo_text = frozen_docs()
+    seeded_roadmap, seeded_todo, seeds = seed_documents(roadmap_text, todo_text)
+    names = ("seeded", "clean")[: args.limit] if args.limit else ("seeded", "clean")
+    copies = {}
+    for name, (road, todo) in {"seeded": (seeded_roadmap, seeded_todo), "clean": (roadmap_text, todo_text)}.items():
+        if name not in names:
+            continue
+        root = make_copy(work / f"{role}_{name}")
+        (root / ROADMAP_REL).write_text(road, encoding="utf-8")
+        (root / TODO_REL).write_text(todo, encoding="utf-8")
+        copies[name] = root
+    (results / f"seeds_{trial.label}.json").write_text(json.dumps(seeds, ensure_ascii=False, indent=1), encoding="utf-8")
+    config = get_agent_config(role, **trial.overrides)
+    provider = make_provider(config)
+    reps = args.reps or REPS[base_role(role)]
+    criteria = CRITERIA[base_role(role)]
+    pair_sets = {name: build_pairs((ROADMAP_REL, (root / ROADMAP_REL).read_text(encoding="utf-8")), (TODO_REL, (root / TODO_REL).read_text(encoding="utf-8"))) for name, root in copies.items()}
+    coverage = {name: seed_coverage(ps.pairs, seeds) for name, ps in pair_sets.items()}
+    (results / f"pairs_{trial.label}.json").write_text(
+        json.dumps({"coverage": coverage, "per_seed": {s["id"]: s for s in seeds}, **{name: pairs_to_json(ps) for name, ps in pair_sets.items()}}, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
+    for name, ps in pair_sets.items():
+        cov = coverage[name]
+        print(f"    generador ({name}): {cov['pairs']} pares de {ps.candidates} candidatos; semillas con sus dos líneas {cov['n_both']}/{cov['seeds']} {cov['both']}, con la línea alterada {cov['n_seed_line']}/{cov['seeds']} {cov['seed_line']}", file=sys.stderr, flush=True)
+    minutes = getattr(args, "max_minutes", None)
+    budget = minutes * 60 if minutes else None
+    started = time.monotonic()
+    deadline = None if budget is None else started + budget
+    per_rep: list[dict] = []
+    rep_judgments: list[dict] = []  # por repetición completa: los juicios de cada copia (para la sensibilidad al umbral)
+    all_stats: list[dict] = []
+    last_rep_s = 0.0
+    truncated_reps = 0
+    for rep in range(1, reps + 1):
+        if rep > 1 and not rep_fits_budget(time.monotonic() - started, last_rep_s, budget):
+            print(f"    presupuesto de {minutes:g} min: no se empieza la repetición {rep} (la anterior tardó {last_rep_s / 60:.1f} min)", file=sys.stderr, flush=True)
+            break
+        rep_started = time.monotonic()
+        entry = {"rep": rep}
+        rep_truncated = False
+        this_rep: dict = {}
+        for name in names:
+            root, ps = copies[name], pair_sets[name]
+            before = snapshot(root)
+            t0 = time.monotonic()
+            judgments = judge_pairs(provider, ps.pairs, config.max_seconds, log_dir=results / "logs", label=f"{trial.label}_{name}_{rep}_v{args.env_variant}", root=root, deadline=deadline)
+            this_rep[name] = judgments
+            stats = judgment_stats(judgments)
+            omitted = stats["by_status"].get("omitida", 0)
+            findings = build_findings(ps.pairs, judgments)
+            positives = [p for p, j in zip(ps.pairs, judgments) if j.positive]
+            report = json.dumps(findings, ensure_ascii=False)
+            verification = verify("doc_checker", report, root=root)
+            citations = _pair_citations(verification.details.get("citations", []), positives) if not omitted else []
+            n_findings = len(findings["incoherencias"])
+            valid_output = bool(verification.details.get("schema_ok")) and not omitted
+            if name == "seeded":
+                match = match_doc_findings(citations, seeds)
+                ok = valid_output and len(match["recovered"]) >= 1
+                notes = f"positivos={n_findings}/{stats['asked']} recuperadas={len(match['recovered'])}/6 {match['recovered']} laxo={len(match['recovered_lenient'])} falsos_positivos={len(match['false_positives'])}"
+            else:
+                match = {"recovered": [], "recovered_lenient": [], "false_positives": list(range(n_findings))}
+                ok = valid_output and n_findings <= criteria["false_positives_max"]
+                notes = f"positivos_en_copia_limpia={n_findings}/{stats['asked']}"
+            notes += f" formato={stats['format_failures']} fallos_peticion={stats['request_failures']} s/par={stats['seconds_mean']} tok/par={stats['completion_tokens_mean']}"
+            if omitted:
+                notes += f" TRUNCADA por presupuesto de tiempo ({omitted} pares sin pedir)"
+                rep_truncated = True
+            usage = Usage(sum(j.prompt_tokens for j in judgments), sum(j.completion_tokens for j in judgments))
+            stop = "budget" if omitted else ("partial" if stats["request_failures"] else "final")
+            result = AgentResult(
+                report=report, steps=stats["asked"], stop_reason=stop, duration_s=time.monotonic() - t0, tokens=usage,
+                last_prompt_tokens=max((j.prompt_tokens for j in judgments), default=None) or None,
+                error="; ".join(sorted({f"{j.status}: {j.motivo}" for j in judgments if j.status in {"timeout", "error"}}))[:300] or None,
+            )
+            details = {
+                "copy": name, "match": match, "n_findings": n_findings, "citations": citations, "valid_output": valid_output,
+                "judgments": [asdict(j) for j in judgments], "judgment_stats": stats, "truncated": bool(omitted), "pairs": len(ps.pairs),
+            }
+            rec.add(_system_record(role, name, rep, result, root, before, args.env_variant, ok, notes, details, verification, trial))
+            all_stats.append(stats)
+            entry[name] = {"recovered": len(match["recovered"]), "false_positives": len(match["false_positives"]) if name == "clean" else None, "findings": n_findings, "valid_output": valid_output, "format_failures": stats["format_failures"]}
+        last_rep_s = time.monotonic() - rep_started
+        if rep_truncated:
+            truncated_reps += 1
+            break
+        per_rep.append(entry)
+        rep_judgments.append(this_rep)
+    summary = _doc_summary(rec.runs, per_rep)
+    asked = sum(s["asked"] for s in all_stats)
+    seconds = sum(s["seconds_total"] for s in all_stats)
+    reps_done = len(per_rep)
+    format_failures = sum(s["format_failures"] for s in all_stats)
+    request_failures = sum(s["request_failures"] for s in all_stats)
+    positives_total = sum(s["positives"] for s in all_stats)
+    incomplete = reps_done < reps
+    summary["metrics"].update(
+        {
+            "generator_coverage": coverage, "reps_done": reps_done, "reps_planned": reps, "incomplete": incomplete, "truncated_reps": truncated_reps,
+            "requests": asked, "format_failures": format_failures, "request_failures": request_failures, "positives": positives_total,
+            "seconds_per_pair_mean": round(seconds / asked, 2) if asked else 0.0, "model_seconds_total": round(seconds, 1),
+        }
+    )
+    lines = [
+        f"Generador de pares (determinista, antes del modelo; {', '.join(f'{n}: {c['pairs']} pares de {pair_sets[n].candidates} candidatos' for n, c in coverage.items())}).",
+    ]
+    if "seeded" in coverage:
+        c = coverage["seeded"]
+        lines.append(f"Cobertura del generador en la copia sembrada: {c['n_both']}/{c['seeds']} semillas con sus dos líneas en un mismo par {c['both']}; {c['n_seed_line']}/{c['seeds']} con la línea alterada en algún par {c['seed_line']}.")
+    lines.append(
+        f"Peticiones: {asked} (una por par), fallos de formato {format_failures} ({100 * format_failures / asked:.1f} %), fallos de petición (tiempo o servidor) {request_failures}, "
+        f"pares declarados contradictorios {positives_total}; {summary['metrics']['seconds_per_pair_mean']} s por par de media."
+        if asked else "Sin peticiones."
+    )
+    if any(j.score is not None for judged in rep_judgments for js in judged.values() for j in js):
+        sens = threshold_sensitivity(rep_judgments, pair_sets, seeds)
+        summary["metrics"]["threshold_sensitivity"] = sens
+        lines.append("Modelo de decisión: criterios juzgados con el umbral fijado de antemano (0,5). Sensibilidad (solo informativa, no para elegir umbral): " + "; ".join(f"u={r['threshold']:g}: recuperadas {r['recovered_mean']} {r['recovered_per_rep']}, falsos positivos {r['false_positives_clean_per_rep']}" for r in sens))
+    lines.append("Las citas las copia el código del documento: son literales por construcción, así que el criterio de citas válidas es trivial y no mide al modelo.")
+    if incomplete:
+        lines.append(f"PROTOCOLO INCOMPLETO: {reps_done} de {reps} repeticiones completas (presupuesto de tiempo {minutes:g} min); los criterios se calculan sobre las completas.")
+    summary["notes"] = lines
+    return summary
+
+
 # -- code_reviewer -------------------------------------------------------------------------------------------------
 CODE_REL = "src/amp_gan/properties.py"
 CODE_SEEDS = [
@@ -1065,6 +1278,7 @@ EVALUATORS = {
     "locator": eval_locator,
     "doc_checker": eval_doc_checker,
     "doc_checker_ss": functools.partial(eval_doc_checker, role="doc_checker_ss"),
+    "doc_checker_pairs": eval_doc_checker_pairs,
     "code_reviewer": eval_code_reviewer,
     "summarizer": eval_summarizer,
     "retriever": eval_retriever,
@@ -1122,9 +1336,12 @@ def evaluate_role(role: str, args) -> dict:
     out["criteria"] = [list(c) for c in summary["criteria"]]
     (results / f"{name}.json").write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
     warm_line = f"\nCalentamiento previo (no cuenta como repetición): {warmup['seconds']} s, {warmup['ps'].get('processor') or '-'}.\n" if warmup else ""
-    markdown = f"# {label} ({config.model}), variante de entorno {args.env_variant}\n{warm_line}\n{criteria_table(label, config.model, summary['criteria'])}\n\n{runs_table(rec.runs)}\n"
+    notes_block = ("\n" + "\n".join(f"- {line}" for line in summary["notes"]) + "\n") if summary.get("notes") else ""
+    markdown = f"# {label} ({config.model}), variante de entorno {args.env_variant}\n{warm_line}{notes_block}\n{criteria_table(label, config.model, summary['criteria'])}\n\n{runs_table(rec.runs)}\n"
     (results / f"{name}.md").write_text(markdown, encoding="utf-8")
     print(f"== {label}: {elapsed / 60:.1f} min\n{criteria_table(label, config.model, summary['criteria'])}", flush=True)
+    for line in summary.get("notes", []):
+        print(f"   {line}", flush=True)
     return out
 
 
@@ -1149,6 +1366,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tag", default="", help="sufijo de los ficheros de resultados (p. ej. v2)")
     parser.add_argument("--model", help="evalúa este modelo de Ollama en el rol, sin tocar agents.toml (los resultados se llaman <rol>@<modelo>); hace un calentamiento previo aparte")
     parser.add_argument("--num-ctx", dest="num_ctx", type=int, help="fija options.num_ctx del rol evaluado (conserva el resto de opciones)")
+    parser.add_argument("--max-tokens", dest="max_tokens", type=int, help="tope de tokens de cada petición del rol evaluado (razonamiento incluido; num_predict en Ollama)")
+    parser.add_argument("--provider", help="cambia el proveedor del rol evaluado (p. ej. ollama_systemone para un modelo de decisión como tev1)")
+    parser.add_argument("--think", choices=["true", "false"], help="fija options.think del rol evaluado (razonamiento de los modelos que lo admiten)")
+    parser.add_argument("--max-seconds", dest="max_seconds", type=float, help="tope de tiempo (s) de cada petición del rol evaluado")
+    parser.add_argument("--max-minutes", dest="max_minutes", type=float, help="solo doc_checker_pairs: presupuesto de tiempo de la evaluación (no se empieza una repetición que no quepa)")
     parser.add_argument("--reps", type=int, help="solo para pruebas rápidas: sustituye las repeticiones del protocolo")
     parser.add_argument("--limit", type=int, help="solo para pruebas rápidas: primeros N casos")
     parser.add_argument("--drop", action="append", help="solo diagnóstico del retriever: quita de la copia los ficheros que cumplan este patrón (repetible)")
@@ -1156,8 +1378,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deadline-min", dest="deadline_min", type=float, help="con 'all': no empezar otro rol pasado este tiempo")
     args = parser.parse_args(argv)
     args.results_dir = args.results_dir or str(Path(args.workdir) / "results")
-    if args.command in ("all", "report") and (args.model or args.num_ctx):
-        parser.error("--model y --num-ctx se aplican a un solo rol: indica el rol (no 'all' ni 'report')")
+    args.think = None if args.think is None else args.think == "true"
+    if args.command in ("all", "report") and (args.model or args.num_ctx or args.max_tokens or args.max_seconds or args.provider or args.think is not None):
+        parser.error("--model, --num-ctx, --max-tokens, --max-seconds, --provider y --think se aplican a un solo rol: indica el rol (no 'all' ni 'report')")
     if args.command == "report":
         table = build_report(Path(args.results_dir))
         print(table)

@@ -6,6 +6,8 @@
 #                   el contexto (options.num_ctx); el endpoint /v1 de Ollama lo fija en 4096 y recorta el
 #                   historial en silencio.
 #   "ollama_openai" Ollama por su endpoint compatible con OpenAI (base_url con /v1; sin control de contexto).
+#   "ollama_systemone"  modelos de DECISIÓN de Ollama (p. ej. tev1): no generan texto; POST {base_url}/v1/systemone devuelve una
+#                   probabilidad por pregunta (solo la usa amp_agents.pairs; ver su docstring).
 #   "openai_compat" | "llamacpp" | "vllm"   cualquier endpoint compatible con OpenAI
 #                   (POST {base_url}/chat/completions).
 # Si un servidor pide clave, indica el NOMBRE de una variable de entorno en api_key_env (nunca la clave aquí).
@@ -101,6 +103,31 @@ definition_fallback = "doc_checker"
 
 [agents.doc_checker_ss.options]
 num_ctx = 12288
+temperature = 0.2
+
+# Versión ACOTADA del verificador documental (amp_agents.pairs): el código propone pares de líneas (una de cada documento) y
+# el modelo solo juzga cada par, sin herramientas y con una petición por par, con `{"contradiccion": true|false}`; las citas
+# del hallazgo las copia el código del documento. El mensaje de sistema es fijo y vive en amp_agents.pairs
+# (PAIR_SYSTEM_PROMPT; no lleva la gobernanza, para gastar poco contexto); `definition_fallback` solo sirve si algún día se
+# ensambla el prompt con build_system_prompt. Mismos criterios que doc_checker. Cada petición tiene su tope de tiempo
+# (max_seconds y timeout) y de tokens (max_tokens, razonamiento incluido; los modelos de razonamiento necesitan mucho más:
+# `eval_roles --max-tokens`). num_ctx pequeño: un par de líneas y el mensaje de sistema caben de sobra en 2048.
+[agents.doc_checker_pairs]
+mode = "single_shot"
+provider = "ollama"
+model = "gemma3:4b"
+base_url = "http://localhost:11434"
+timeout = 60
+max_seconds = 60
+max_tokens = 96
+tools = []
+read = ["context", "src"]
+write = []
+verifier = "doc_checker"
+definition_fallback = "doc_checker_ss"
+
+[agents.doc_checker_pairs.options]
+num_ctx = 2048
 temperature = 0.2
 
 [agents.code_reviewer]

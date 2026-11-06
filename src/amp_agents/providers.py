@@ -11,6 +11,8 @@ cambiar de proveedor (o de configuración), no de código.
   endpoint compatible con OpenAI de Ollama no permite fijar el contexto (``num_ctx``, 4096 por defecto) ni
   desactivar el razonamiento de modelos como qwen3 (``think``); el resto del sistema no nota la diferencia.
   Además ofrece ``embed`` (``POST /api/embed``) para modelos de embeddings.
+- :class:`SystemOneProvider`: modelos de DECISIÓN de Ollama (p. ej. ``tev1``), que no generan texto: ``POST {base_url}/v1/systemone``
+  con un texto de estado y una o varias preguntas, y devuelven una probabilidad (0-1) por pregunta.
 - :class:`ScriptedProvider`: respuestas predefinidas, sin red (para tests).
 """
 
@@ -383,6 +385,52 @@ class OllamaProvider(ChatProvider):
             if not isinstance(vector, list) or not vector or not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in vector):
                 raise ProviderError(f"vector de embed no válido: {str(vector)[:100]}")
             out.append([float(x) for x in vector])
+        return out
+
+
+class SystemOneProvider(ChatProvider):
+    """Modelo de decisión de Ollama (``POST {base_url}/v1/systemone``): no genera texto, devuelve probabilidades.
+
+    El cuerpo es ``{"model", "state", "questions": {nombre: {"type": "noul", "instructions": pregunta}}}`` y la respuesta
+    ``{"answers": {nombre: {"type": "noul", "noul": p}}}`` con ``p`` entre 0 y 1. :meth:`decide` devuelve ``{nombre: p}``;
+    una respuesta sin todas las preguntas o con una probabilidad que no sea un número entre 0 y 1 es un
+    :class:`ProviderError`. La petición tiene tope de tiempo de reloj (como el resto de proveedores). ``chat`` no existe: el modelo
+    responde «does not support chat».
+    """
+
+    name = "ollama_systemone"
+
+    def __init__(self, base_url: str = DEFAULT_OLLAMA_URL, model: str = "", timeout: float = 60.0, options: dict | None = None):
+        base = base_url.rstrip("/")
+        self.base_url = base[: -len("/v1")] if base.endswith("/v1") else base
+        self.model = model
+        self.timeout = timeout
+        self.options = dict(options or {})
+
+    def chat(self, messages: Sequence[dict], tools: Sequence[dict] | None = None, timeout: float | None = None) -> AssistantMessage:
+        raise ProviderError(f"el modelo de decisión {self.model!r} no genera texto (no admite chat): usa decide()")
+
+    def decide(self, state: str, questions: dict[str, str], timeout: float | None = None) -> dict[str, float]:
+        """Probabilidad de cada pregunta (sí = 1) dado el texto ``state``; ``ProviderError``/``ProviderTimeout`` si falla."""
+        if not questions:
+            raise ProviderError("decide necesita al menos una pregunta")
+        body = {
+            "model": self.model,
+            "state": state,
+            "questions": {name: {"type": "noul", "instructions": text} for name, text in questions.items()},
+        }
+        limit = self.timeout if timeout is None else min(self.timeout, timeout)
+        data = post_json(f"{self.base_url}/v1/systemone", body, self.base_url, limit)
+        answers = data.get("answers") if isinstance(data, dict) else None
+        if not isinstance(answers, dict):
+            raise ProviderError(f"respuesta sin answers: {str(data)[:200]}")
+        out: dict[str, float] = {}
+        for name in questions:
+            item = answers.get(name)
+            value = item.get("noul") if isinstance(item, dict) else None
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
+                raise ProviderError(f"probabilidad no válida para {name!r}: {str(item)[:100]}")
+            out[name] = float(value)
         return out
 
 

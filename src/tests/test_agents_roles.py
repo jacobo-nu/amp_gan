@@ -23,6 +23,7 @@ EXPECTED = {
     "locator": ("agent", "llama3.2:3b"),
     "doc_checker": ("agent", "phi4-mini"),
     "doc_checker_ss": ("single_shot", "phi4-mini"),
+    "doc_checker_pairs": ("single_shot", "gemma3:4b"),
     "code_reviewer": ("agent", "qwen2.5-coder:7b"),
     "summarizer": ("single_shot", "gemma3:4b"),
     "retriever": ("embedding", "nomic-embed-text"),
