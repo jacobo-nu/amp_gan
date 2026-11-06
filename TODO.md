@@ -7,15 +7,15 @@ Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](
 - **Hecho en Fase 3:** WGAN-GP (notebook 03), condicional por longitud (04, criterios A y B cumplidos), condicional por hidrofobicidad (05: criterio A cumplido con el A.2 revisado después de ver el resultado, B no cumplido) y agente ejecutor con modelo local (`src/amp_agents/`), más cinco roles locales evaluados (ver abajo). 541 tests.
 - **Modelos en Ollama** (los tres grandes anteriores se borraron el 2026-11-05): `qwen3:4b` (ejecutor, herramientas), `llama3.2:3b` (herramientas), `phi4-mini` (herramientas), `qwen2.5-coder:7b` (herramientas; se pasa un 9 % a CPU en la GPU de 6 GB), `gemma3:4b` (sin herramientas), `nomic-embed-text` (embeddings).
 
-## Propuestas pendientes de decisión (2026-11-05 18:07 CET)
-Contexto: la evaluación en vivo de los cinco roles locales (criterios fijados de antemano, resultados en el roadmap) no cumplió ninguno; el resumidor y el revisor con corrección de línea son los candidatos útiles. Segunda iteración propuesta, en una rama nueva (p. ej. `feat/local-roles-2`), con **los mismos criterios** y el mismo protocolo (`src/amp_agents/eval_roles.py`):
-- [ ] **1. Localizador (`llama3.2:3b`, 10 % de aciertos):** sustituirlo por una herramienta determinista (lo que hace es `grep`); el modelo solo lo empeora. Decidir si el rol se elimina o se reasigna.
-- [ ] **2. Verificador de coherencia (`phi4-mini`, 0 % de citas válidas; no llama a herramientas e inventa citas):** probarlo en modo `single_shot`, con los dos documentos dentro del mensaje y sin herramientas.
-- [ ] **3. Revisor de código (`qwen2.5-coder:7b`, 1,0 de 5 defectos; 1,7 con un ajuste):** añadir un verificador que reasigne la línea buscando la cita literal en el fichero (el modelo acierta el texto pero desplaza el número); no detectó nunca los defectos de validación ni de argumentos intercambiados.
-- [ ] **4. Resumidor (`gemma3:4b`, cifras 97,8 % e idioma bien, pero hasta 246 palabras frente a 150):** recortar por código a 150 palabras o cambiar la definición («unas 120 palabras» no se cumple); usa punto decimal en lugar de coma.
-- [ ] **5. Recuperador (`nomic-embed-text`, 60 % top-3 frente a 73 % de BM25):** usar BM25 como recuperador por defecto y dejar los embeddings como opción. Probar un modelo de embeddings mejor para castellano, `bge-m3` (~1,2 GB), **requiere permiso del usuario para descargarlo** (pendiente).
-- [ ] Más repeticiones (ahora 2–3) para que las diferencias entre ajustes sean concluyentes.
-- [ ] Limpieza señalada por el ejecutor: el aviso fijo `DATA_NOTICE` de `agents.py` menciona un apartado «Fallos» que no existe en los roles de salida JSON.
+## Roles locales: segunda iteración hecha (2026-11-06), pendiente de fusionar
+Rama `feat/local-roles-2` (3 commits, 638 tests, sin fusionar en `main` a la espera del usuario). Resultados en el roadmap: ningún rol cumple todos sus criterios. Decisiones ya aplicadas: localizador retirado (`amp_agents.locate`), BM25 por defecto, corrección de línea y recorte por código, `doc_checker_ss` creado y evaluado (no cumple nada), `DATA_NOTICE` limpiado.
+- [ ] Fusionar `feat/local-roles-2` en `main` (`merge --ff-only`) y reintentar `git push origin main` (lo hace el usuario)
+- [ ] **Decidir** qué hacer con `doc_checker`/`doc_checker_ss` (phi4-mini no sirve para esto): retirarlo, o probar un modelo distinto en una pasada (p. ej. `gemma3:4b`, que ya está descargado; ojo con el contexto: los dos documentos son unos 5 600 tokens)
+- [ ] **Decidir** sobre el resumidor: dejarlo con recorte por código (cumple palabras e idioma; cifras 94,3 % frente a 95 %) o añadir un paso que quite las frases con cifras no respaldadas
+- [ ] **Decidir** sobre el revisor de código (1,2 de 5 defectos): ¿se mantiene solo como apoyo con comprobación humana, o se retira?
+- [ ] Integrar `postprocess_summary` y la línea corregida en la salida de `run.py` (hoy solo están en la evaluación)
+- [ ] `bge-m3` (~1,2 GB) para el recuperador: **requiere permiso del usuario para descargarlo**; BM25 ya es el valor por defecto
+- [ ] Decidir si el verificador de citas debe aceptar `ruta#línea` (alguna respuesta del modelo lo usa); cambiarlo después de ver resultados exigiría declararlo igual que el A.2 de hidrofobicidad
 
 ## Ahora
 - [ ] Fase 3, GAN condicional por longitud e hidrofobicidad a la vez (percentiles 10–90). Plan: conservar los criterios de longitud, usar el A.2 revisado (`conditions.mae_vs_reference`) para las dos propiedades y fijar todos los criterios antes de entrenar; comparar con las dos condicionales y con la referencia `gan_stabc`
