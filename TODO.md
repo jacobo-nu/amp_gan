@@ -7,9 +7,8 @@ Tareas inmediatas. El plan por fases está en [context/constitution/roadmap.md](
 - **Hecho en Fase 3:** WGAN-GP (notebook 03), condicional por longitud (04, criterios A y B cumplidos), condicional por hidrofobicidad (05: criterio A cumplido con el A.2 revisado después de ver el resultado, B no cumplido) y agente ejecutor con modelo local (`src/amp_agents/`), más cinco roles locales evaluados (ver abajo). 541 tests.
 - **Modelos en Ollama** (los tres grandes anteriores se borraron el 2026-11-05): `qwen3:4b` (ejecutor, herramientas), `llama3.2:3b` (herramientas), `phi4-mini` (herramientas), `qwen2.5-coder:7b` (herramientas; se pasa un 9 % a CPU en la GPU de 6 GB), `gemma3:4b` (sin herramientas), `nomic-embed-text` (embeddings).
 
-## Roles locales: segunda iteración hecha (2026-11-06), pendiente de fusionar
-Rama `feat/local-roles-2` (3 commits, 638 tests, sin fusionar en `main` a la espera del usuario). Resultados en el roadmap: ningún rol cumple todos sus criterios. Decisiones ya aplicadas: localizador retirado (`amp_agents.locate`), BM25 por defecto, corrección de línea y recorte por código, `doc_checker_ss` creado y evaluado (no cumple nada), `DATA_NOTICE` limpiado.
-- [ ] Fusionar `feat/local-roles-2` en `main` (`merge --ff-only`) y reintentar `git push origin main` (lo hace el usuario)
+## Roles locales: segunda iteración hecha y fusionada en `main` (2026-11-06)
+Rama `feat/local-roles-2` (3 commits, 638 tests), fusionada con `--ff-only`; falta el `git push origin main` del usuario. Resultados en el roadmap: ningún rol cumple todos sus criterios. Decisiones ya aplicadas: localizador retirado (`amp_agents.locate`), BM25 por defecto, corrección de línea y recorte por código, `doc_checker_ss` creado y evaluado (no cumple nada), `DATA_NOTICE` limpiado.
 - [ ] **Decidir** qué hacer con `doc_checker`/`doc_checker_ss` (phi4-mini no sirve para esto): retirarlo, o probar un modelo distinto en una pasada (p. ej. `gemma3:4b`, que ya está descargado; ojo con el contexto: los dos documentos son unos 5 600 tokens)
 - [ ] **Decidir** sobre el resumidor: dejarlo con recorte por código (cumple palabras e idioma; cifras 94,3 % frente a 95 %) o añadir un paso que quite las frases con cifras no respaldadas
 - [ ] **Decidir** sobre el revisor de código (1,2 de 5 defectos): ¿se mantiene solo como apoyo con comprobación humana, o se retira?
