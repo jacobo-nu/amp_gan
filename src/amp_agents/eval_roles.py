@@ -10,6 +10,14 @@ Uso (desde la carpeta ``src``, con Ollama en marcha y los modelos descargados)::
     python -m amp_agents.eval_roles retriever     --workdir ...
     python -m amp_agents.eval_roles all           --workdir ... --deadline-min 90   # sin el localizador; añádelo con --roles locator,...
     python -m amp_agents.eval_roles report        --results-dir ...
+    python -m amp_agents.eval_roles doc_checker_ss --model gemma3:4b --num-ctx 12288 --reps 5 --tag g3 --workdir ...   # otro modelo, sin tocar agents.toml
+
+Con ``--model NOMBRE`` (y opcionalmente ``--num-ctx N``) se evalúa OTRO modelo en un rol existente con el mismo protocolo y
+los mismos criterios, sin editar ``agents.toml``: los resultados y las tablas llevan el modelo en el nombre del rol
+(``doc_checker_ss@gemma3-4b``) y no pisan los de otros modelos. Funciona con todos los roles (también el recuperador, con un
+modelo de embeddings: ``retriever --model bge-m3``). Antes de empezar se comprueba en ``/api/tags`` que el modelo está
+instalado (no se descarga nada) y se hace una petición de calentamiento, con su propio tope de tiempo, que se registra
+aparte (``warmup`` en el JSON) y no cuenta como repetición. ``--model`` no se admite con ``all``.
 
 Todo se hace sobre COPIAS dentro de ``--workdir`` (``context/`` sin ``context/data/`` y ``src/``, sin este script ni
 sus tests, para que las preguntas y sus respuestas no estén en el material consultado): las herramientas y la política
@@ -59,6 +67,7 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -69,9 +78,10 @@ import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .agents import PROJECT_ROOT, get_agent_config
+from .agents import PROJECT_ROOT, ConfigError, get_agent_config, make_provider
 from .locate import find_definitions, find_lines  # noqa: F401 (la verdad del localizador; se reexportan)
 from .loop import AgentResult
+from .providers import ProviderError
 from .retrieval import LexicalRetriever, chunk_project
 from .run import prepare_task, retrieve, run_task
 from .smoke_live import make_copy as _smoke_copy
@@ -117,6 +127,72 @@ REPS = {"locator": 2, "doc_checker": 3, "code_reviewer": 3, "summarizer": 3}
 def base_role(role: str) -> str:
     """Rol cuyo protocolo y criterios (``CRITERIA``, ``REPS``) usa ``role``: él mismo, o su rol base si es una variante."""
     return VARIANT_ROLES.get(role, role)
+
+
+# -- prueba de otro modelo en un rol existente (``--model``, ``--num-ctx``) -----------------------------------------
+@dataclass(frozen=True)
+class Trial:
+    """Cómo se evalúa un rol: nombre que sale en tablas y ficheros y cambios de configuración (sin tocar ``agents.toml``)."""
+
+    label: str
+    overrides: dict = field(default_factory=dict)
+    model: str | None = None  # solo con --model: activa la comprobación del modelo y el calentamiento
+
+
+def safe_model_name(model: str) -> str:
+    """Nombre del modelo apto para ficheros y tablas: ``gemma3:4b`` -> ``gemma3-4b``."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", model).strip("-")
+
+
+def trial_for(role: str, args, config_path=None) -> Trial:
+    """Rol evaluado con ``--model`` / ``--num-ctx`` (si se dieron).
+
+    Sin ninguno de los dos, el nombre es el del rol y no cambia nada. Con ``--model`` el nombre es ``<rol>@<modelo>``
+    (``doc_checker_ss@gemma3-4b``), para que los resultados no pisen los de otros modelos. ``--num-ctx`` fija
+    ``options.num_ctx`` conservando el resto de opciones del rol; solo (sin ``--model``) añade ``@ctx<N>`` al nombre.
+    """
+    model = getattr(args, "model", None) or None
+    num_ctx = getattr(args, "num_ctx", None) or None
+    overrides: dict = {}
+    label = role
+    if model:
+        overrides["model"] = model
+        label = f"{role}@{safe_model_name(model)}"
+    if num_ctx:
+        if num_ctx < 256:
+            raise SystemExit("error: --num-ctx debe ser al menos 256")
+        overrides["options"] = {**get_agent_config(role, config_path).options, "num_ctx": num_ctx}
+        if not model:
+            label = f"{role}@ctx{num_ctx}"
+    return Trial(label=label, overrides=overrides, model=model)
+
+
+def check_model_available(base_url: str, model: str) -> None:
+    """Sale con un mensaje claro si Ollama no responde o no tiene ``model`` (consulta ``/api/tags``)."""
+    available = server_models(base_url)
+    if available is None:
+        raise SystemExit(f"error: el servidor no responde en {base_url} (¿está Ollama en marcha?)")
+    if model not in available and f"{model}:latest" not in available:
+        raise SystemExit(f"error: el modelo {model!r} no está instalado en Ollama (instalados: {', '.join(sorted(available)) or 'ninguno'}); instálalo antes con `ollama pull` (esta herramienta no descarga modelos)")
+
+
+def warm_up(config, provider=None) -> dict:
+    """Primera petición, mínima y con el mismo ``num_ctx``, de un modelo recién cargado: se mide aparte.
+
+    La primera petición tarda más (carga de pesos y reserva del contexto) y no es una repetición del protocolo. Tiene su
+    límite de tiempo (``config.timeout``). Devuelve ``{"seconds", "ok", "error", "ps"}``; no lanza excepciones del proveedor.
+    """
+    provider = provider or make_provider(config)
+    started = time.monotonic()
+    ok, error = True, ""
+    try:
+        if config.mode == "embedding":
+            provider.embed(["calentamiento"], timeout=config.timeout)
+        else:
+            provider.chat([{"role": "user", "content": "Responde solo con la palabra: listo"}], timeout=config.timeout)
+    except ProviderError as exc:  # incluye ProviderTimeout
+        ok, error = False, f"{type(exc).__name__}: {exc}"
+    return {"seconds": round(time.monotonic() - started, 1), "ok": ok, "error": error, "ps": ollama_ps(config.base_url, config.model)}
 
 
 # -- copias ------------------------------------------------------------------------------------------------
@@ -221,12 +297,13 @@ class RunRecord:
     details: dict = field(default_factory=dict)
 
 
-def _system_record(role: str, case: str, rep: int, result: AgentResult, root: Path, before: dict, env_variant: int, success: bool, notes: str, details: dict, verification=None) -> RunRecord:
-    config = get_agent_config(role, env_variant=env_variant)
+def _system_record(role: str, case: str, rep: int, result: AgentResult, root: Path, before: dict, env_variant: int, success: bool, notes: str, details: dict, verification=None, trial: Trial | None = None) -> RunRecord:
+    trial = trial or Trial(role)
+    config = get_agent_config(role, env_variant=env_variant, **trial.overrides)
     ps = ollama_ps(config.base_url, config.model)
     modified = snapshot(root) != before
     return RunRecord(
-        role=role,
+        role=trial.label,
         model=config.model,
         case=case,
         rep=rep,
@@ -336,6 +413,7 @@ def grade_locator(report: str, expected: list[tuple[str, int]], root: Path) -> t
 
 
 def eval_locator(args, rec: Recorder, work: Path, results: Path) -> dict:
+    trial = trial_for("locator", args)
     root = make_copy(work / "locator_copy")
     questions = locator_questions(root)
     if args.limit:
@@ -347,13 +425,13 @@ def eval_locator(args, rec: Recorder, work: Path, results: Path) -> dict:
     for q in questions:
         for rep in range(1, reps + 1):
             before = snapshot(root)
-            result = run_task("locator", q["question"], root=root, log_dir=results / "logs", run_label=f"locator_{q['id']}_{rep}_v{args.env_variant}", env_variant=args.env_variant)
+            result = run_task("locator", q["question"], root=root, log_dir=results / "logs", run_label=f"{trial.label}_{q['id']}_{rep}_v{args.env_variant}", env_variant=args.env_variant, **trial.overrides)
             ok, details = (grade_locator(result.report, q["expected"], root) if result.stop_reason == "final" else (False, {"errors": [f"parada: {result.stop_reason}"]}))
             details["expected"] = q["expected"]
             details["kind"] = q["kind"]
             note = f"esperadas={len(q['expected'])} aciertos={'sí' if ok else 'NO'} faltan={len(details.get('missing', []))} sobran={len(details.get('extra', []))} {details.get('errors', '')}"
             verification = verify("locator", result.report, root=root) if result.report else None
-            rec.add(_system_record("locator", q["id"], rep, result, root, before, args.env_variant, ok, note, details, verification))
+            rec.add(_system_record("locator", q["id"], rep, result, root, before, args.env_variant, ok, note, details, verification, trial))
     runs = rec.runs
     exact = sum(r.success for r in runs) / len(runs) if runs else 0.0
     by_kind: dict[str, list[bool]] = {}
@@ -512,6 +590,7 @@ def eval_doc_checker(args, rec: Recorder, work: Path, results: Path, role: str =
     repeticiones y los umbrales salen siempre de la entrada ``doc_checker`` de ``REPS`` y ``CRITERIA``. Con ``--limit N``
     solo se ejecutan los N primeros casos de cada repetición (``seeded``, ``clean``).
     """
+    trial = trial_for(role, args)
     roadmap_text, todo_text = frozen_docs()
     seeded_roadmap, seeded_todo, seeds = seed_documents(roadmap_text, todo_text)
     names = ("seeded", "clean")[: args.limit] if args.limit else ("seeded", "clean")
@@ -523,10 +602,10 @@ def eval_doc_checker(args, rec: Recorder, work: Path, results: Path, role: str =
         (root / ROADMAP_REL).write_text(road, encoding="utf-8")
         (root / TODO_REL).write_text(todo, encoding="utf-8")
         copies[name] = root
-    (results / f"seeds_{role}.json").write_text(json.dumps(seeds, ensure_ascii=False, indent=1), encoding="utf-8")
+    (results / f"seeds_{trial.label}.json").write_text(json.dumps(seeds, ensure_ascii=False, indent=1), encoding="utf-8")
     reps = args.reps or REPS[base_role(role)]
     criteria = CRITERIA[base_role(role)]
-    verifier = get_agent_config(role).verifier or "doc_checker"
+    verifier = get_agent_config(role, **trial.overrides).verifier or "doc_checker"
     per_rep: list[dict] = []
     for rep in range(1, reps + 1):
         entry = {"rep": rep}
@@ -534,7 +613,7 @@ def eval_doc_checker(args, rec: Recorder, work: Path, results: Path, role: str =
             root = copies[name]
             task, context = prepare_task(role, [ROADMAP_REL, TODO_REL], root, DOC_NOTE)
             before = snapshot(root)
-            result = run_task(role, task, root=root, log_dir=results / "logs", run_label=f"{role}_{name}_{rep}_v{args.env_variant}", env_variant=args.env_variant)
+            result = run_task(role, task, root=root, log_dir=results / "logs", run_label=f"{trial.label}_{name}_{rep}_v{args.env_variant}", env_variant=args.env_variant, **trial.overrides)
             verification = verify(verifier, result.report, root=root) if result.stop_reason == "final" else None
             citations = verification.details.get("citations", []) if verification else []
             obj, _, _ = parse_json_output(result.report) if result.report else (None, False, None)
@@ -553,7 +632,7 @@ def eval_doc_checker(args, rec: Recorder, work: Path, results: Path, role: str =
             if not verification:
                 notes += f" sin salida utilizable (parada {result.stop_reason})"
             details = {"copy": name, "match": match, "n_findings": n_findings, "citations": citations, "valid_output": valid_output}
-            record = _system_record(role, name, rep, result, root, before, args.env_variant, ok, notes, details, verification)
+            record = _system_record(role, name, rep, result, root, before, args.env_variant, ok, notes, details, verification, trial)
             rec.add(record)
             entry[name] = {"recovered": len(match["recovered"]), "false_positives": len(match["false_positives"]) if name == "clean" else None, "findings": n_findings, "valid_output": valid_output}
         per_rep.append(entry)
@@ -679,6 +758,7 @@ def match_code_findings(obj, seeds: list[dict], tolerance: int = 2) -> dict:
 
 
 def eval_code_reviewer(args, rec: Recorder, work: Path, results: Path) -> dict:
+    trial = trial_for("code_reviewer", args)
     source = (PROJECT_ROOT / CODE_REL).read_text(encoding="utf-8")
     seeded_text, seeds = seed_code_defects(source)
     (results / "seeds_code_reviewer.json").write_text(json.dumps(seeds, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -695,7 +775,7 @@ def eval_code_reviewer(args, rec: Recorder, work: Path, results: Path) -> dict:
             root, text = copies[name]
             task, context = prepare_task("code_reviewer", [CODE_REL], root)
             before = snapshot(root)
-            result = run_task("code_reviewer", task, root=root, log_dir=results / "logs", run_label=f"code_reviewer_{name}_{rep}_v{args.env_variant}", env_variant=args.env_variant)
+            result = run_task("code_reviewer", task, root=root, log_dir=results / "logs", run_label=f"{trial.label}_{name}_{rep}_v{args.env_variant}", env_variant=args.env_variant, **trial.overrides)
             verification = verify("code_reviewer", result.report, root=root, source=text) if result.stop_reason == "final" else None
             obj, _, _ = parse_json_output(result.report) if result.report else (None, False, None)
             valid_output = bool(verification and verification.details.get("schema_ok"))
@@ -718,7 +798,7 @@ def eval_code_reviewer(args, rec: Recorder, work: Path, results: Path) -> dict:
                 "copy": name, "match": match, "citations": citations, "valid_output": valid_output, "seeds": seeds if name == "seeded" else [],
                 "match_corrected": match_fixed, "line_correction": None if not correction else {k: v for k, v in correction.items() if k != "obj"},
             }
-            rec.add(_system_record("code_reviewer", name, rep, result, root, before, args.env_variant, ok, notes, details, verification))
+            rec.add(_system_record("code_reviewer", name, rep, result, root, before, args.env_variant, ok, notes, details, verification, trial))
             entry[name] = {
                 "recovered": len(match["recovered"]), "findings": match["n_findings"], "valid_output": valid_output,
                 "recovered_corrected": len(match_fixed["recovered"]), "findings_verifiable": correction["verifiable"] if correction else 0,
@@ -797,6 +877,7 @@ def summary_corrected_metrics(report: str, source: str, max_words: int | None = 
 
 
 def eval_summarizer(args, rec: Recorder, work: Path, results: Path) -> dict:
+    trial = trial_for("summarizer", args)
     reps = args.reps or REPS["summarizer"]
     processed = PROJECT_ROOT / "context" / "data" / "processed"
     cases = list(SUMMARY_INPUTS.items())
@@ -812,7 +893,7 @@ def eval_summarizer(args, rec: Recorder, work: Path, results: Path) -> dict:
         task, context = prepare_task("summarizer", paths, root, max_chars=SUMMARY_MAX_CHARS)
         for rep in range(1, reps + 1):
             before = snapshot(root)
-            result = run_task("summarizer", task, root=root, log_dir=results / "logs", run_label=f"summarizer_{case}_{rep}_v{args.env_variant}", env_variant=args.env_variant)
+            result = run_task("summarizer", task, root=root, log_dir=results / "logs", run_label=f"{trial.label}_{case}_{rep}_v{args.env_variant}", env_variant=args.env_variant, **trial.overrides)
             verification = verify("summarizer", result.report, source=context["source"]) if result.stop_reason in {"final", "length"} and result.report else None
             ok = bool(verification and verification.valid and result.stop_reason == "final")
             d = verification.details if verification else {}
@@ -826,7 +907,7 @@ def eval_summarizer(args, rec: Recorder, work: Path, results: Path) -> dict:
                 details["corrected"] = summary_corrected_metrics(result.report, context["source"])
                 fixed = details["corrected"]
                 notes += f" | corregido: palabras={fixed['words']} cifras={fixed['numbers']['supported']}/{fixed['numbers']['total']} castellano={fixed['spanish']['ratio']:.2f} recorte={fixed['mode']}"
-            rec.add(_system_record("summarizer", case, rep, result, root, before, args.env_variant, ok, notes, details, None))
+            rec.add(_system_record("summarizer", case, rep, result, root, before, args.env_variant, ok, notes, details, None, trial))
     return _summarizer_summary(rec.runs)
 
 
@@ -891,6 +972,7 @@ def retriever_rank(hits: list[dict], truth: list[tuple[str, str]], k: int = 3) -
 
 
 def eval_retriever(args, rec: Recorder, work: Path, results: Path) -> dict:
+    trial = trial_for("retriever", args)
     root = make_copy(work / "retriever_copy")
     dropped = 0
     for pattern in args.drop or []:  # solo diagnóstico: quita de la COPIA los ficheros que cumplan el patrón
@@ -901,13 +983,13 @@ def eval_retriever(args, rec: Recorder, work: Path, results: Path) -> dict:
     chunks = chunk_project(root)
     queries = RETRIEVER_QUERIES[: args.limit] if args.limit else RETRIEVER_QUERIES
     unanswerable = [q for q, truth in queries if not any(any(c.ruta.endswith(f) and kw.lower() in c.texto.lower() for c in chunks) for f, kw in truth)]
-    config = get_agent_config("retriever")
+    config = get_agent_config("retriever", **trial.overrides)
     index_file = root / config.index_dir / "index.json"
     if index_file.exists():
         index_file.unlink()
     t0 = time.monotonic()
     before_index = snapshot(root)
-    first = retrieve(queries[0][0], root=root, k=3, lexical=False, build=True)  # construye y guarda el índice
+    first = retrieve(queries[0][0], root=root, k=3, lexical=False, build=True, **trial.overrides)  # construye y guarda el índice
     build_s = time.monotonic() - t0
     ps = ollama_ps(config.base_url, config.model)
     size_kb = round(index_file.stat().st_size / 1024) if index_file.exists() else None
@@ -917,7 +999,7 @@ def eval_retriever(args, rec: Recorder, work: Path, results: Path) -> dict:
     per_query = []
     for number, (query, truth) in enumerate(queries):
         t1 = time.monotonic()
-        emb_hits = first if number == 0 else retrieve(query, root=root, k=3, lexical=False)
+        emb_hits = first if number == 0 else retrieve(query, root=root, k=3, lexical=False, **trial.overrides)
         emb_s = time.monotonic() - t1
         lex_hits = [h.as_dict() for h in lexical.search(query, 3)]
         r_emb, r_lex = retriever_rank(emb_hits, truth), retriever_rank(lex_hits, truth)
@@ -930,7 +1012,7 @@ def eval_retriever(args, rec: Recorder, work: Path, results: Path) -> dict:
             "lexical_top": [(h["ruta"], h["linea"], round(h["puntuacion"], 3)) for h in lex_hits],
         }
         record = RunRecord(
-            role="retriever", model=config.model, case=f"q{number + 1:02d}", rep=1, success=r_emb is not None, stop_reason="final", steps=1, tokens=None,
+            role=trial.label, model=config.model, case=f"q{number + 1:02d}", rep=1, success=r_emb is not None, stop_reason="final", steps=1, tokens=None,
             prompt_tokens_last=None, seconds=round(emb_s, 2), context_length=ps.get("context_length"), num_ctx_config=config.options.get("num_ctx"),
             processor=ps.get("processor", ""), cpu_offload=ps.get("cpu_offload"), notes=f"embeddings={'top' + str(r_emb) if r_emb else 'fallo'} léxico={'top' + str(r_lex) if r_lex else 'fallo'} | {query}", details=details,
         )
@@ -952,7 +1034,7 @@ def eval_retriever(args, rec: Recorder, work: Path, results: Path) -> dict:
             "dropped_files": dropped, "drop_patterns": args.drop or [], "both_top3": both, "only_embedding": only_emb, "only_lexical": only_lex, "processor": ps.get("processor"), "copy_changes_besides_index": [k for k in snapshot(root) if k not in before_index and not k.startswith(".agent_runs/")] if modified else [],
         },
         "criteria": [
-            ("Acierto en el top-3 con embeddings (nomic-embed-text)", ">= 80 %", f"{100 * emb_hits_n / n:.0f} % ({emb_hits_n}/{n}); top-1: {emb_top1}/{n}", emb_hits_n / n >= CRITERIA["retriever"]["top3_min"]),
+            (f"Acierto en el top-3 con embeddings ({config.model})", ">= 80 %", f"{100 * emb_hits_n / n:.0f} % ({emb_hits_n}/{n}); top-1: {emb_top1}/{n}", emb_hits_n / n >= CRITERIA["retriever"]["top3_min"]),
             ("Línea base léxica (BM25), misma verdad (informativo)", "-", f"{100 * lex_hits_n / n:.0f} % ({lex_hits_n}/{n}); top-1: {lex_top1}/{n}", lex_hits_n >= emb_hits_n),
         ],
     }
@@ -990,33 +1072,47 @@ EVALUATORS = {
 
 
 def evaluate_role(role: str, args) -> dict:
-    """Ejecuta la evaluación de un rol, escribe JSON y Markdown en ``results`` y descarga el modelo."""
+    """Ejecuta la evaluación de un rol, escribe JSON y Markdown en ``results`` y descarga el modelo.
+
+    Con ``--model`` / ``--num-ctx`` (``args.model``, ``args.num_ctx``) se evalúa otro modelo (u otro contexto) en el mismo rol
+    sin tocar ``agents.toml``; los resultados llevan el modelo en el nombre (``<rol>@<modelo>``). Con ``--model`` se comprueba
+    antes de empezar que Ollama tiene el modelo y se hace una petición de calentamiento, registrada aparte (``warmup``) y que
+    no cuenta como repetición.
+    """
     work, results = Path(args.workdir), Path(args.results_dir)
     _ensure_outside_repo(work)
     _ensure_outside_repo(results)
     work.mkdir(parents=True, exist_ok=True)
     results.mkdir(parents=True, exist_ok=True)
-    config = get_agent_config(role, env_variant=args.env_variant)
-    available = server_models(config.base_url)
-    if available is None:
-        raise SystemExit(f"error: el servidor no responde en {config.base_url} (¿está Ollama en marcha?)")
-    if config.model not in available and f"{config.model}:latest" not in available:
-        raise SystemExit(f"error: el modelo {config.model} no está disponible en el servidor: {available}")
-    name = f"{role}_{args.tag}" if args.tag else role
-    print(f"== {role} ({config.model}) variante de entorno {args.env_variant}", file=sys.stderr, flush=True)
+    trial = trial_for(role, args)
+    config = get_agent_config(role, env_variant=args.env_variant, **trial.overrides)
+    check_model_available(config.base_url, config.model)
+    label = trial.label
+    name = f"{label}_{args.tag}" if args.tag else label
+    print(f"== {label} ({config.model}) variante de entorno {args.env_variant}, num_ctx={config.options.get('num_ctx')}", file=sys.stderr, flush=True)
     rec = Recorder(results, name)
+    warmup = None
     started = time.monotonic()
     try:
+        if trial.model:
+            warmup = warm_up(config)
+            print(f"    calentamiento: {warmup['seconds']}s {'ok' if warmup['ok'] else 'FALLO ' + warmup['error']} {warmup['ps'].get('processor', '')}", file=sys.stderr, flush=True)
+            if not warmup["ok"]:
+                raise SystemExit(f"error: el modelo {config.model} no respondió a la petición de calentamiento: {warmup['error']}")
+        started = time.monotonic()  # el calentamiento no cuenta en el tiempo de la evaluación
         summary = EVALUATORS[role](args, rec, work, results)
     finally:
         stop_note = ollama_stop(config.model)
     elapsed = time.monotonic() - started
     out = {
-        "role": role,
+        "role": label,
+        "command_role": role,
         "model": config.model,
+        "num_ctx": config.options.get("num_ctx"),
         "env_variant": args.env_variant,
         "tag": args.tag,
         "elapsed_s": round(elapsed, 1),
+        "warmup": warmup,
         "ollama_ps_after": ollama_ps_text(),
         "ollama_stop": stop_note,
         "protocol": CRITERIA[base_role(role)],
@@ -1025,9 +1121,10 @@ def evaluate_role(role: str, args) -> dict:
     }
     out["criteria"] = [list(c) for c in summary["criteria"]]
     (results / f"{name}.json").write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
-    markdown = f"# {role} ({config.model}), variante de entorno {args.env_variant}\n\n{criteria_table(role, config.model, summary['criteria'])}\n\n{runs_table(rec.runs)}\n"
+    warm_line = f"\nCalentamiento previo (no cuenta como repetición): {warmup['seconds']} s, {warmup['ps'].get('processor') or '-'}.\n" if warmup else ""
+    markdown = f"# {label} ({config.model}), variante de entorno {args.env_variant}\n{warm_line}\n{criteria_table(label, config.model, summary['criteria'])}\n\n{runs_table(rec.runs)}\n"
     (results / f"{name}.md").write_text(markdown, encoding="utf-8")
-    print(f"== {role}: {elapsed / 60:.1f} min\n{criteria_table(role, config.model, summary['criteria'])}", flush=True)
+    print(f"== {label}: {elapsed / 60:.1f} min\n{criteria_table(label, config.model, summary['criteria'])}", flush=True)
     return out
 
 
@@ -1050,6 +1147,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--results-dir", dest="results_dir", help="carpeta de resultados (por defecto <workdir>/results)")
     parser.add_argument("--env-variant", dest="env_variant", type=int, default=1, help="variante de la sección «Entorno de ejecución» del prompt")
     parser.add_argument("--tag", default="", help="sufijo de los ficheros de resultados (p. ej. v2)")
+    parser.add_argument("--model", help="evalúa este modelo de Ollama en el rol, sin tocar agents.toml (los resultados se llaman <rol>@<modelo>); hace un calentamiento previo aparte")
+    parser.add_argument("--num-ctx", dest="num_ctx", type=int, help="fija options.num_ctx del rol evaluado (conserva el resto de opciones)")
     parser.add_argument("--reps", type=int, help="solo para pruebas rápidas: sustituye las repeticiones del protocolo")
     parser.add_argument("--limit", type=int, help="solo para pruebas rápidas: primeros N casos")
     parser.add_argument("--drop", action="append", help="solo diagnóstico del retriever: quita de la copia los ficheros que cumplan este patrón (repetible)")
@@ -1057,6 +1156,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deadline-min", dest="deadline_min", type=float, help="con 'all': no empezar otro rol pasado este tiempo")
     args = parser.parse_args(argv)
     args.results_dir = args.results_dir or str(Path(args.workdir) / "results")
+    if args.command in ("all", "report") and (args.model or args.num_ctx):
+        parser.error("--model y --num-ctx se aplican a un solo rol: indica el rol (no 'all' ni 'report')")
     if args.command == "report":
         table = build_report(Path(args.results_dir))
         print(table)

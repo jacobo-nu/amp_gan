@@ -468,3 +468,165 @@ def test_all_can_include_doc_checker_ss_only_when_asked(monkeypatch, tmp_path):
     assert E.main(["all", "--workdir", work, "--roles", "doc_checker,doc_checker_ss"]) == 0 and called == ["doc_checker", "doc_checker_ss"]
     called.clear()
     assert E.main(["doc_checker_ss", "--workdir", work]) == 0 and called == ["doc_checker_ss"]
+
+
+# -- --model / --num-ctx: evaluar otro modelo en un rol existente sin tocar agents.toml ---------------------------------------
+def trial_args(tmp_path, model=None, num_ctx=None, tag="", reps=1, limit=None):
+    return E.argparse.Namespace(workdir=str(tmp_path / "w"), results_dir=str(tmp_path / "r"), env_variant=1, tag=tag, reps=reps, limit=limit, drop=None, model=model, num_ctx=num_ctx)
+
+
+def patch_live(monkeypatch, scripted, installed, configs=None):
+    """Sustituye Ollama por un proveedor guionizado; ``configs`` recoge la configuración con la que se crea cada proveedor."""
+    from amp_agents import run as R
+
+    def make(config):
+        if configs is not None:
+            configs.append(config)
+        return scripted
+
+    monkeypatch.setattr(R, "make_provider", make)
+    monkeypatch.setattr(E, "make_provider", make)
+    monkeypatch.setattr(E, "server_models", lambda base_url: installed)
+    monkeypatch.setattr(E, "ollama_ps", lambda *a, **k: {"processor": "100% GPU", "context_length": 12288})
+    monkeypatch.setattr(E, "ollama_stop", lambda model: "ok")
+    monkeypatch.setattr(E, "ollama_ps_text", lambda: "")
+
+
+def test_trial_for_names_the_role_with_the_model_and_keeps_the_other_options():
+    plain = E.trial_for("doc_checker_ss", E.argparse.Namespace())
+    assert plain.label == "doc_checker_ss" and plain.overrides == {} and plain.model is None
+    t = E.trial_for("doc_checker_ss", E.argparse.Namespace(model="gemma3:4b", num_ctx=None))
+    assert t.label == "doc_checker_ss@gemma3-4b" and t.overrides == {"model": "gemma3:4b"} and t.model == "gemma3:4b"
+    t = E.trial_for("doc_checker_ss", E.argparse.Namespace(model="gemma3:4b", num_ctx=10240))
+    assert t.overrides["options"] == {"num_ctx": 10240, "temperature": 0.2}  # solo cambia num_ctx
+    assert E.trial_for("summarizer", E.argparse.Namespace(model=None, num_ctx=4096)).label == "summarizer@ctx4096"
+    assert E.safe_model_name("hf.co/usuario/modelo:Q4_K_M") == "hf.co-usuario-modelo-Q4_K_M"
+    with pytest.raises(SystemExit):
+        E.trial_for("summarizer", E.argparse.Namespace(model=None, num_ctx=10))
+
+
+def test_model_trial_uses_the_model_in_files_tables_and_requests_without_editing_the_config(tmp_path, monkeypatch):
+    from amp_agents.providers import ScriptedProvider
+
+    before = E.get_agent_config("doc_checker_ss")
+    configs: list = []
+    scripted = ScriptedProvider(["listo", *ss_answers()])  # el calentamiento consume la primera respuesta
+    patch_live(monkeypatch, scripted, ["gemma3:4b", "phi4-mini:latest"], configs)
+    out = E.evaluate_role("doc_checker_ss", trial_args(tmp_path, model="gemma3:4b", num_ctx=10240, tag="g3"))
+    results = tmp_path / "r"
+    for name in ("doc_checker_ss@gemma3-4b_g3.json", "doc_checker_ss@gemma3-4b_g3.md", "doc_checker_ss@gemma3-4b_g3.runs.jsonl", "seeds_doc_checker_ss@gemma3-4b.json"):
+        assert (results / name).is_file(), name
+    assert not (results / "doc_checker_ss_g3.json").exists()  # no pisa los resultados del modelo por defecto
+    assert out["role"] == "doc_checker_ss@gemma3-4b" and out["command_role"] == "doc_checker_ss" and out["model"] == "gemma3:4b" and out["num_ctx"] == 10240
+    assert [r["role"] for r in out["runs"]] == ["doc_checker_ss@gemma3-4b"] * 2 and {r["model"] for r in out["runs"]} == {"gemma3:4b"}
+    assert [r["num_ctx_config"] for r in out["runs"]] == [10240, 10240]
+    assert "doc_checker_ss@gemma3-4b (gemma3:4b)" in (results / "doc_checker_ss@gemma3-4b_g3.md").read_text(encoding="utf-8")
+    assert "doc_checker_ss@gemma3-4b" in E.build_report(results)
+    # el protocolo no cambia: mismas repeticiones del protocolo (aquí 1 por --reps) y mismos criterios
+    assert out["protocol"] == E.CRITERIA["doc_checker"] and [c[1] for c in out["criteria"]] == [">= 90 %", ">= 4", "<= 2"]
+    # calentamiento: una petición aparte, con el mismo modelo y num_ctx, que no cuenta como repetición
+    assert out["warmup"]["ok"] and out["warmup"]["ps"]["processor"] == "100% GPU" and len(out["runs"]) == 2
+    assert len(scripted.received) == 3 and scripted.received[0][0]["content"].startswith("Responde solo")
+    assert all(c.model == "gemma3:4b" and c.options["num_ctx"] == 10240 for c in configs)
+    assert scripted.timeouts[0] == E.get_agent_config("doc_checker_ss").timeout  # el calentamiento también tiene tope de tiempo
+    assert E.get_agent_config("doc_checker_ss") == before and E.get_agent_config("doc_checker_ss").model == "phi4-mini"
+
+
+def test_model_trial_works_with_agent_mode_roles_and_the_installed_tag_may_be_implicit(tmp_path, monkeypatch):
+    from amp_agents.providers import AssistantMessage, ScriptedProvider
+
+    seeded, clean = ss_answers()
+    scripted = ScriptedProvider(["listo", AssistantMessage.calls(("read_file", {"path": E.TODO_REL})), seeded, clean])
+    patch_live(monkeypatch, scripted, ["qwen3:4b", "otro:latest"])
+    out = E.evaluate_role("doc_checker", trial_args(tmp_path, model="otro"))  # «otro» coincide con «otro:latest»
+    assert out["role"] == "doc_checker@otro" and [r["role"] for r in out["runs"]] == ["doc_checker@otro"] * 2
+    assert (tmp_path / "r" / "doc_checker@otro.json").is_file() and out["metrics"]["valid_citations"] == 2
+
+
+def test_model_trial_fails_before_any_request_when_the_model_is_not_installed(tmp_path, monkeypatch):
+    from amp_agents.providers import ScriptedProvider
+
+    scripted = ScriptedProvider([])
+    configs: list = []
+    patch_live(monkeypatch, scripted, ["phi4-mini:latest"], configs)
+    with pytest.raises(SystemExit) as error:
+        E.evaluate_role("doc_checker_ss", trial_args(tmp_path, model="no-existe:7b"))
+    assert "no-existe:7b" in str(error.value) and "no está instalado" in str(error.value) and "phi4-mini:latest" in str(error.value)
+    assert scripted.received == [] and configs == []  # ni calentamiento ni repeticiones
+    assert list((tmp_path / "r").glob("*.runs.jsonl")) == []
+    monkeypatch.setattr(E, "server_models", lambda base_url: None)
+    with pytest.raises(SystemExit, match="no responde"):
+        E.evaluate_role("doc_checker_ss", trial_args(tmp_path, model="gemma3:4b"))
+
+
+def test_warmup_failure_stops_the_evaluation_without_counting_repetitions(tmp_path, monkeypatch):
+    from amp_agents.providers import ProviderTimeout, ScriptedProvider
+
+    scripted = ScriptedProvider([ProviderTimeout("el servidor no respondió en 240 s")])
+    patch_live(monkeypatch, scripted, ["gemma3:4b"])
+    with pytest.raises(SystemExit, match="calentamiento"):
+        E.evaluate_role("doc_checker_ss", trial_args(tmp_path, model="gemma3:4b"))
+    assert len(scripted.received) == 1  # solo se hizo la petición de calentamiento
+    assert not list((tmp_path / "r").glob("*.json"))
+
+
+def test_without_model_there_is_no_warmup_and_names_do_not_change(tmp_path, monkeypatch):
+    out, results, scripted = run_ss_evaluation(tmp_path, monkeypatch, list(ss_answers()))
+    assert out["warmup"] is None and len(scripted.received) == 2 and out["role"] == "doc_checker_ss"
+
+
+def test_warm_up_embedding_model_calls_embed_with_a_timeout(monkeypatch):
+    calls = []
+
+    class Embedder:
+        def embed(self, texts, timeout=None):
+            calls.append((list(texts), timeout))
+            return [[0.1, 0.2]]
+
+    monkeypatch.setattr(E, "ollama_ps", lambda *a, **k: {})
+    warm = E.warm_up(E.get_agent_config("retriever", model="bge-m3"), Embedder())
+    assert warm["ok"] and calls == [(["calentamiento"], E.get_agent_config("retriever").timeout)]
+
+
+def test_model_trial_for_the_retriever_uses_the_given_embedding_model(tmp_path, monkeypatch):
+    from amp_agents import run as R
+
+    seen: list = []
+
+    class Embedder:
+        def embed(self, texts, timeout=None):
+            return [[float(len(t) % 7 + 1), 1.0, float(len(t) % 3)] for t in texts]
+
+        def embed_query(self, text):  # por si el recuperador la usa
+            return self.embed([text])[0]
+
+    def make(config):
+        seen.append(config.model)
+        return Embedder()
+
+    monkeypatch.setattr(R, "make_provider", make)
+    monkeypatch.setattr(E, "make_provider", make)
+    monkeypatch.setattr(E, "server_models", lambda base_url: ["nomic-embed-text:latest", "bge-m3:latest"])
+    monkeypatch.setattr(E, "ollama_ps", lambda *a, **k: {})
+    monkeypatch.setattr(E, "ollama_stop", lambda model: "ok")
+    monkeypatch.setattr(E, "ollama_ps_text", lambda: "")
+    out = E.evaluate_role("retriever", trial_args(tmp_path, model="bge-m3", limit=2))
+    assert out["role"] == "retriever@bge-m3" and out["model"] == "bge-m3" and out["warmup"]["ok"]
+    assert set(seen) == {"bge-m3"} and {r["model"] for r in out["runs"]} == {"bge-m3"}
+    assert "(bge-m3)" in out["criteria"][0][0] and (tmp_path / "r" / "retriever@bge-m3.json").is_file()
+
+
+def test_cli_accepts_model_and_num_ctx_only_for_a_single_role(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(E, "evaluate_role", lambda role, args: seen.append((role, args.model, args.num_ctx)))
+    assert E.main(["doc_checker_ss", "--workdir", str(tmp_path / "w"), "--model", "gemma3:4b", "--num-ctx", "12288"]) == 0
+    assert seen == [("doc_checker_ss", "gemma3:4b", 12288)]
+    assert E.main(["summarizer", "--workdir", str(tmp_path / "w")]) == 0 and seen[-1] == ("summarizer", None, None)
+    for command in ("all", "report"):
+        with pytest.raises(SystemExit):
+            E.main([command, "--workdir", str(tmp_path / "w"), "--model", "gemma3:4b"])
+
+
+def test_declared_protocol_is_untouched_by_the_model_option():
+    assert E.REPS == {"locator": 2, "doc_checker": 3, "code_reviewer": 3, "summarizer": 3}
+    assert E.CRITERIA["doc_checker"] == {"valid_citations_min": 0.90, "recovered_mean_min": 4.0, "false_positives_max": 2}
