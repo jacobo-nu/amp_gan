@@ -75,6 +75,18 @@ siguen juzgando sobre la salida CRUDA del modelo, y se informa además, en filas
 umbral, de la salida corregida por código por encima: línea del revisor reasignada a la de su cita literal
 (``verifiers.correct_review_lines``) y resumen con coma decimal y recortado a 150 palabras (``verifiers.postprocess_summary``).
 
+- query_rewriter (``llama3.2:3b`` por defecto, ``single_shot``): las mismas 15 consultas del recuperador; un modelo reescribe cada pregunta
+  en palabras clave y se busca con la pregunta + palabras (BM25). Criterio NUEVO (``CRITERIA["query_rewriter"]``): top-3 con reescritura >=
+  top-3 de BM25 simple (medido en la misma ejecución) + 2 y como mucho 1 consulta que pasa de acierto a fallo. Se registra el hash del corpus
+  al empezar y al terminar. Diseño en ``amp_agents.rewrite``.
+- router (``llama3.2:3b`` por defecto, ``single_shot``): 48 peticiones etiquetadas (``fixtures/router_requests.json``, 8 por rol); el modelo elige
+  el rol que la atiende. Criterios NUEVOS (``CRITERIA["router"]``): exactitud >= 85 % y recall >= 60 % en cada rol. Diseño en ``amp_agents.router``.
+- summarizer: además de las filas crudas y «[corregido por código]», con un paso determinista de FILTRO tras el recorte (quita las frases con
+  cifras no respaldadas por la entrada; ``verifiers.filter_unsupported_sentences``) se informan filas «[recortado + filtro]» con los mismos
+  umbrales de ``CRITERIA["summarizer"]``. Un resumen filtrado de menos de 30 palabras (``FILTER_MIN_WORDS``) o vacío es un FALLO DE FORMATO y
+  cuenta como no cumplido: esas filas solo se cumplen si ninguna ejecución es fallo de formato. Al ser código, el cumplimiento depende del
+  filtro y no del modelo.
+
 Las ejecuciones fallidas (JSON inválido, tiempo agotado, error del servidor) cuentan como no exitosas y se anotan.
 Por ejecución se registra: éxito, pasos, tokens, segundos, motivo de parada, contexto efectivo (``/api/ps``) y si el
 modelo se pasó parcialmente a la CPU.
@@ -84,6 +96,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import json
 import re
 import shutil
@@ -100,8 +113,10 @@ from .agents import PROJECT_ROOT, ConfigError, get_agent_config, make_provider
 from .locate import find_definitions, find_lines  # noqa: F401 (la verdad del localizador; se reexportan)
 from .func_review import CATEGORIES, CATEGORY_BY_KEY, build_findings as build_func_findings, match_by_category, request_stats, review_units, seed_flags, split_functions, yes_rates
 from .loop import AgentResult
+from .rewrite import rewrite_query
+from .router import NO_ROLE, Route, ROUTER_ROLES, confusion_matrix, load_requests, matrix_table, role_metrics, route_request, route_request_decision
 from .pairs import COMPAT_FORMAT_SCHEMA, SENSITIVITY_THRESHOLDS, build_findings, build_pairs, judge_pairs, judgment_stats, pair_mode, pairs_to_json, seed_coverage
-from .providers import ProviderError, ProviderTimeout, Usage
+from .providers import ProviderError, ProviderTimeout, SystemOneProvider, Usage
 from .retrieval import LexicalRetriever, build_index, chunk_project, prefixes_for, resolve_index_dir, save_index
 from .run import prepare_task, retrieve, run_task
 from .smoke_live import make_copy as _smoke_copy
@@ -112,6 +127,7 @@ from .verifiers import (
     correct_review_lines,
     count_words,
     parse_json_output,
+    FILTER_MIN_WORDS,
     postprocess_summary,
     retrieval_rank,
     spanish_score,
@@ -136,7 +152,9 @@ VARIANT_ROLES = {
     "code_reviewer_funcs": "code_reviewer",
     "retriever_hybrid": "retriever",
 }
-COMMAND_ROLES = (*ALL_ROLES, *VARIANT_ROLES)
+# Roles con protocolo propio (criterios nuevos en ``CRITERIA``), de una sola repetición (temperatura 0); no entran en ``all``.
+EXTRA_ROLES = ("query_rewriter", "router")
+COMMAND_ROLES = (*ALL_ROLES, *VARIANT_ROLES, *EXTRA_ROLES)
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 DEFAULT_WORKDIR = Path(tempfile.gettempdir()) / "amp_roles_eval"
 EXCLUDED_FROM_COPY = ("src/amp_agents/eval_roles.py",)  # y src/tests/test_agents_eval*.py
@@ -148,6 +166,9 @@ CRITERIA = {
     "code_reviewer": {"recovered_mean_min": 3.0, "valid_citations_min": 0.90, "false_positives_max": 2},
     "summarizer": {"numbers_min": 0.95, "max_words": 150},
     "retriever": {"top3_min": 0.80},
+    # criterios NUEVOS fijados el 2026-11-06 antes de medir (ver ``amp_agents.rewrite`` y ``amp_agents.router``)
+    "query_rewriter": {"gain_min": 2, "regressions_max": 1},
+    "router": {"accuracy_min": 0.85, "recall_min": 0.60},
 }
 REPS = {"locator": 2, "doc_checker": 3, "code_reviewer": 3, "summarizer": 3}
 
@@ -1260,6 +1281,28 @@ def summary_corrected_metrics(report: str, source: str, max_words: int | None = 
     }
 
 
+def summary_filtered_metrics(report: str, source: str, max_words: int | None = None) -> dict:
+    """Métricas del resumen tras recorte + filtro de cifras no respaldadas (``postprocess_summary(filter_numbers=True)``).
+
+    ``failure`` es verdadero si el texto final está vacío o tiene menos de :data:`FILTER_MIN_WORDS` palabras.
+    """
+    limit = max_words or CRITERIA["summarizer"]["max_words"]
+    fixed, info = postprocess_summary(report, source, limit, filter_numbers=True)
+    words = count_words(fixed)
+    return {
+        "text": fixed,
+        "mode": info["mode"],
+        "words": words,
+        "words_trimmed": info["words_trimmed"],
+        "numbers": info["numbers_after"],
+        "numbers_trimmed": info["numbers_trimmed"],
+        "spanish": spanish_score(fixed),
+        "removed": info["filter"]["removed"],
+        "sentences": info["filter"]["sentences"],
+        "failure": words < FILTER_MIN_WORDS,
+    }
+
+
 def eval_summarizer(args, rec: Recorder, work: Path, results: Path) -> dict:
     trial = trial_for("summarizer", args)
     reps = args.reps or REPS["summarizer"]
@@ -1267,6 +1310,10 @@ def eval_summarizer(args, rec: Recorder, work: Path, results: Path) -> dict:
     cases = list(SUMMARY_INPUTS.items())
     if args.limit:
         cases = cases[: args.limit]
+    minutes = getattr(args, "max_minutes", None)
+    budget = minutes * 60 if minutes else None
+    started = time.monotonic()
+    skipped = 0
     for case, (metrics_name, info_name) in cases:
         root = make_copy(work / f"summarizer_{case}")
         folder = root / "context" / "data" / "processed"
@@ -1276,6 +1323,9 @@ def eval_summarizer(args, rec: Recorder, work: Path, results: Path) -> dict:
         paths = [f"context/data/processed/{metrics_name}", f"context/data/processed/{info_name}"]
         task, context = prepare_task("summarizer", paths, root, max_chars=SUMMARY_MAX_CHARS)
         for rep in range(1, reps + 1):
+            if budget is not None and time.monotonic() - started > budget:
+                skipped += 1
+                continue
             before = snapshot(root)
             result = run_task("summarizer", task, root=root, log_dir=results / "logs", run_label=f"{trial.label}_{case}_{rep}_v{args.env_variant}", env_variant=args.env_variant, **trial.overrides)
             verification = verify("summarizer", result.report, source=context["source"]) if result.stop_reason in {"final", "length"} and result.report else None
@@ -1291,8 +1341,37 @@ def eval_summarizer(args, rec: Recorder, work: Path, results: Path) -> dict:
                 details["corrected"] = summary_corrected_metrics(result.report, context["source"])
                 fixed = details["corrected"]
                 notes += f" | corregido: palabras={fixed['words']} cifras={fixed['numbers']['supported']}/{fixed['numbers']['total']} castellano={fixed['spanish']['ratio']:.2f} recorte={fixed['mode']}"
+                details["filtered"] = summary_filtered_metrics(result.report, context["source"])
+                filt = details["filtered"]
+                notes += f" | filtro: frases quitadas={filt['removed']}/{filt['sentences']} palabras={filt['words']} cifras={filt['numbers']['supported']}/{filt['numbers']['total']}{' FALLO DE FORMATO (< 30 palabras)' if filt['failure'] else ''}"
             rec.add(_system_record("summarizer", case, rep, result, root, before, args.env_variant, ok, notes, details, None, trial))
-    return _summarizer_summary(rec.runs)
+    summary = _summarizer_summary(rec.runs)
+    summary["notes"] = _summarizer_notes(rec.runs)
+    if skipped:
+        summary.setdefault("notes", []).append(f"PROTOCOLO INCOMPLETO: {skipped} ejecuciones sin hacer por el presupuesto de tiempo ({minutes:g} min).")
+    return summary
+
+
+def _summarizer_notes(runs: list[RunRecord]) -> list[str]:
+    """Líneas de resumen: crudo / recortado / recortado + filtro (cifras respaldadas y palabras) y frases quitadas por el filtro."""
+    filtered = [r.details["filtered"] for r in runs if r.details.get("filtered")]
+    if not filtered:
+        return []
+    raw_n = [r.details.get("numbers") or {} for r in runs]
+    raw_total, raw_ok = sum(n.get("total", 0) for n in raw_n), sum(n.get("supported", 0) for n in raw_n)
+    trim_total, trim_ok = sum(f["numbers_trimmed"]["total"] for f in filtered), sum(f["numbers_trimmed"]["supported"] for f in filtered)
+    fin_total, fin_ok = sum(f["numbers"]["total"] for f in filtered), sum(f["numbers"]["supported"] for f in filtered)
+
+    def pct(ok: int, total: int) -> str:
+        return f"{100 * ok / total:.1f} % ({ok}/{total})" if total else "sin cifras"
+
+    removed = [f["removed"] for f in filtered]
+    return [
+        f"Cifras respaldadas: crudo {pct(raw_ok, raw_total)}; recortado {pct(trim_ok, trim_total)}; recortado + filtro {pct(fin_ok, fin_total)}.",
+        f"Palabras: crudo {[r.details.get('words') for r in runs]}; recortado {[f['words_trimmed'] for f in filtered]}; recortado + filtro {[f['words'] for f in filtered]}.",
+        f"Frases quitadas por el filtro: {sum(removed)} en total ({removed} por ejecución, de {[f['sentences'] for f in filtered]} frases tras el recorte); fallos de formato (< {FILTER_MIN_WORDS} palabras): {sum(f['failure'] for f in filtered)} de {len(filtered)}.",
+        "Aviso: el filtro es código; el cumplimiento de las filas «[recortado + filtro]» depende del filtro y no del modelo.",
+    ]
 
 
 def _summarizer_summary(runs: list[RunRecord]) -> dict:
@@ -1311,10 +1390,32 @@ def _summarizer_summary(runs: list[RunRecord]) -> dict:
     fixed_words = [f["words"] for f in fixed]
     fixed_words_ok = bool(fixed) and all(0 < w <= CRITERIA["summarizer"]["max_words"] for w in fixed_words)
     fixed_spanish_ok = bool(fixed) and all(f["spanish"]["is_spanish"] for f in fixed)
+    filtered = [r.details["filtered"] for r in runs if r.details.get("filtered")]
+    filter_rows: list = []
+    filter_metrics: dict = {}
+    if filtered:
+        f_total = sum(f["numbers"]["total"] for f in filtered)
+        f_supported = sum(f["numbers"]["supported"] for f in filtered)
+        f_ratio = f_supported / f_total if f_total else 0.0
+        f_words = [f["words"] for f in filtered]
+        failures = sum(1 for f in filtered if f["failure"])
+        clean = failures == 0
+        removed = [f["removed"] for f in filtered]
+        filter_metrics = {
+            "numbers_supported": f_supported, "numbers_total": f_total, "words": f_words, "failures": failures, "removed": removed,
+            "sentences": [f["sentences"] for f in filtered], "numbers_trimmed": [f["numbers_trimmed"]["supported"] for f in filtered], "numbers_trimmed_total": [f["numbers_trimmed"]["total"] for f in filtered],
+        }
+        filter_rows = [
+            ("[recortado + filtro] Cifras del resumen presentes en la entrada (agregado; sin fallos de formato)", ">= 95 %", f"{100 * f_ratio:.1f} % ({f_supported}/{f_total})", clean and f_total > 0 and f_ratio >= CRITERIA["summarizer"]["numbers_min"]),
+            ("[recortado + filtro] Palabras por resumen (todas las ejecuciones; sin fallos de formato)", "<= 150", f"máx. {max(f_words)} {f_words}", clean and all(0 < w <= CRITERIA["summarizer"]["max_words"] for w in f_words)),
+            ("[recortado + filtro] En castellano (todas las ejecuciones; sin fallos de formato)", "proporción >= 0,8", "; ".join(f"{f['spanish']['ratio']:.2f}" for f in filtered), clean and all(f["spanish"]["is_spanish"] for f in filtered)),
+            (f"[recortado + filtro] Fallos de formato (resumen filtrado < {FILTER_MIN_WORDS} palabras)", "0", f"{failures} de {len(filtered)}; frases quitadas {removed}", clean),
+        ]
     return {
         "metrics": {
             "numbers_supported": supported, "numbers_total": total, "words": words,
             "corrected": {"numbers_supported": fixed_supported, "numbers_total": fixed_total, "words": fixed_words, "modes": [f["mode"] for f in fixed]},
+            **({"filtered": filter_metrics} if filtered else {}),
         },
         "criteria": [
             ("Cifras del resumen presentes en la entrada (agregado)", ">= 95 %", f"{100 * ratio:.1f} % ({supported}/{total})", total > 0 and ratio >= CRITERIA["summarizer"]["numbers_min"]),
@@ -1324,6 +1425,7 @@ def _summarizer_summary(runs: list[RunRecord]) -> dict:
             ("[corregido por código] Cifras del resumen presentes en la entrada (agregado)", ">= 95 %", f"{100 * fixed_ratio:.1f} % ({fixed_supported}/{fixed_total})", fixed_total > 0 and fixed_ratio >= CRITERIA["summarizer"]["numbers_min"]),
             ("[corregido por código] Palabras por resumen (todas las ejecuciones)", "<= 150", f"máx. {max(fixed_words, default='-')} {fixed_words}", fixed_words_ok),
             ("[corregido por código] En castellano (todas las ejecuciones)", "proporción >= 0,8", "; ".join(f"{f['spanish']['ratio']:.2f}" for f in fixed), fixed_spanish_ok),
+            *filter_rows,
         ],
     }
 
@@ -1483,6 +1585,180 @@ def eval_retriever(args, rec: Recorder, work: Path, results: Path, role: str = "
     }
 
 
+# -- query_rewriter: reescritura de la consulta para BM25 ------------------------------------------------------------------
+def corpus_hash(chunks) -> str:
+    """Huella (12 primeros caracteres de SHA-256) de los fragmentos del corpus: ruta, línea y texto de cada uno, en orden."""
+    return hashlib.sha256("\n".join(f"{c.ruta}:{c.linea}:{c.texto}" for c in chunks).encode("utf-8")).hexdigest()[:12]
+
+
+def eval_query_rewriter(args, rec: Recorder, work: Path, results: Path, role: str = "query_rewriter") -> dict:
+    """Evalúa el reescritor de consultas (``amp_agents.rewrite``) con las 15 preguntas del recuperador y BM25 simple en la misma ejecución.
+
+    Se registra el hash del corpus (copia del proyecto) al empezar y el de una copia nueva del repositorio al terminar.
+    ``--max-minutes`` limita el tiempo total: las preguntas que no se llegan a hacer se anotan y el protocolo se declara incompleto.
+    """
+    trial = trial_for(role, args)
+    config = get_agent_config(role, **trial.overrides)
+    root = make_copy(work / f"{role}_copy")
+    chunks = chunk_project(root)
+    hash_before = corpus_hash(chunks)
+    queries = RETRIEVER_QUERIES[: args.limit] if args.limit else RETRIEVER_QUERIES
+    unanswerable = [q for q, truth in queries if not any(any(c.ruta.endswith(f) and kw.lower() in c.texto.lower() for c in chunks) for f, kw in truth)]
+    lexical = LexicalRetriever(chunks)
+    provider = make_provider(config)
+    minutes = getattr(args, "max_minutes", None)
+    started = time.monotonic()
+    budget = minutes * 60 if minutes else None
+    per_query: list[dict] = []
+    rewrites = []
+    skipped = 0
+    ps: dict = {}
+    for number, (query, truth) in enumerate(queries):
+        if budget is not None and time.monotonic() - started > budget:
+            skipped = len(queries) - number
+            break
+        base_hits = [h.as_dict() for h in lexical.search(query, 3)]
+        r_base = retriever_rank(base_hits, truth)
+        rw = rewrite_query(provider, query, config.max_seconds, log_dir=results / "logs", label=f"{trial.label}_q{number + 1:02d}_v{args.env_variant}", root=root)
+        new_hits = [h.as_dict() for h in lexical.search(rw.query, 3)]
+        r_new = retriever_rank(new_hits, truth)
+        if not ps:
+            ps = ollama_ps(config.base_url, config.model)
+        rewrites.append(rw)
+        details = {
+            "query": query, "truth": truth, "words": rw.words, "status": rw.status, "expanded": rw.query, "base_rank": r_base, "rewritten_rank": r_new,
+            "base_top": [(h["ruta"], h["linea"], round(h["puntuacion"], 3)) for h in base_hits], "rewritten_top": [(h["ruta"], h["linea"], round(h["puntuacion"], 3)) for h in new_hits],
+            "reply": rw.reply, "prompt_tokens": rw.prompt_tokens, "completion_tokens": rw.completion_tokens,
+        }
+        rec.add(
+            RunRecord(
+                role=trial.label, model=config.model, case=f"q{number + 1:02d}", rep=1, success=r_new is not None, stop_reason="final" if rw.status in {"ok", "fuera_de_rango"} else rw.status,
+                steps=1, tokens=rw.prompt_tokens + rw.completion_tokens, prompt_tokens_last=rw.prompt_tokens or None, seconds=rw.seconds, context_length=ps.get("context_length"),
+                num_ctx_config=config.options.get("num_ctx"), processor=ps.get("processor", ""), cpu_offload=ps.get("cpu_offload"),
+                notes=f"BM25={_rank_label(r_base)} reescrito={_rank_label(r_new)} estado={rw.status} palabras={rw.words} | {query}", details=details,
+            )
+        )
+        per_query.append(details)
+    root_after = make_copy(work / f"{role}_copy_after")
+    hash_after = corpus_hash(chunk_project(root_after))
+    shutil.rmtree(root_after, ignore_errors=True)
+    n = len(per_query)
+    base_n = sum(d["base_rank"] is not None for d in per_query)
+    new_n = sum(d["rewritten_rank"] is not None for d in per_query)
+    gained = [(i, d) for i, d in enumerate(per_query) if d["base_rank"] is None and d["rewritten_rank"] is not None]
+    lost = [(i, d) for i, d in enumerate(per_query) if d["base_rank"] is not None and d["rewritten_rank"] is None]
+    moved = [(i, d) for i, d in enumerate(per_query) if d["base_rank"] is not None and d["rewritten_rank"] is not None and d["base_rank"] != d["rewritten_rank"]]
+    failures = sum(r.format_failure for r in rewrites)
+    request_failures = sum(r.status in {"timeout", "error"} for r in rewrites)
+    seconds = [r.seconds for r in rewrites]
+    mean_s = round(sum(seconds) / len(seconds), 2) if seconds else 0.0
+    c = CRITERIA["query_rewriter"]
+
+    def show(items) -> str:
+        return "; ".join(f"q{i + 1:02d} {d['words']}" for i, d in items) or "ninguna"
+
+    notes = [
+        f"Top-3 de {n} consultas: BM25 simple {base_n}/{n}; con reescritura ({config.model}) {new_n}/{n}. Con 15 preguntas el resultado es solo indicativo.",
+        f"Fallo -> acierto ({len(gained)}): {show(gained)}.",
+        f"Acierto -> fallo ({len(lost)}): {show(lost)}.",
+        f"Cambian de posición dentro del top-3 ({len(moved)}): {'; '.join(f'q{i + 1:02d} {d['base_rank']}->{d['rewritten_rank']}' for i, d in moved) or 'ninguna'}.",
+        f"Fallos de formato (fuera de 3-8 palabras, vacía o sin JSON): {failures}; fallos de petición (tiempo o servidor): {request_failures}; {mean_s} s por petición; procesador {ps.get('processor') or 'desconocido'}.",
+        f"Hash del corpus ({len(chunks)} fragmentos): al empezar {hash_before}, al terminar {hash_after} ({'sin cambios' if hash_before == hash_after else 'CAMBIÓ durante la ejecución'}).",
+    ]
+    if skipped:
+        notes.append(f"PROTOCOLO INCOMPLETO: {skipped} consultas sin evaluar por el presupuesto de tiempo ({minutes:g} min).")
+    return {
+        "metrics": {
+            "queries": n, "unanswerable_queries": unanswerable, "bm25_top3": base_n, "rewritten_top3": new_n, "gain": new_n - base_n,
+            "gained": [f"q{i + 1:02d}" for i, _ in gained], "lost": [f"q{i + 1:02d}" for i, _ in lost], "format_failures": failures, "request_failures": request_failures,
+            "seconds_per_request_mean": mean_s, "corpus_chunks": len(chunks), "corpus_hash_before": hash_before, "corpus_hash_after": hash_after,
+            "corpus_unchanged": hash_before == hash_after, "skipped_queries": skipped, "processor": ps.get("processor"),
+        },
+        "notes": notes,
+        "criteria": [
+            (f"Top-3 con reescritura >= top-3 de BM25 simple + {c['gain_min']} consultas", f">= BM25 + {c['gain_min']}", f"{new_n}/{n} frente a BM25 {base_n}/{n} (diferencia {new_n - base_n:+d})", n > 0 and new_n - base_n >= c["gain_min"]),
+            ("Consultas que pasan de acierto a fallo (máximo)", f"<= {c['regressions_max']}", f"{len(lost)} {[f'q{i + 1:02d}' for i, _ in lost]}", n > 0 and len(lost) <= c["regressions_max"]),
+        ],
+    }
+
+
+# -- router: elegir el rol que atiende una petición ----------------------------------------------------------------------------
+def eval_router(args, rec: Recorder, work: Path, results: Path, role: str = "router") -> dict:
+    """Evalúa el enrutador (``amp_agents.router``) con las 48 peticiones etiquetadas de ``fixtures/router_requests.json``.
+
+    Una petición por elemento (temperatura 0, una sola repetición). Con un proveedor de decisión (``--provider ollama_systemone``) se hace una
+    pregunta ``choice`` y se elige la opción de mayor probabilidad. ``--max-minutes`` limita el tiempo total (las peticiones sin hacer
+    cuentan como sin rol y el protocolo se declara incompleto).
+    """
+    trial = trial_for(role, args)
+    config = get_agent_config(role, **trial.overrides)
+    provider = make_provider(config)
+    decision = isinstance(provider, SystemOneProvider)
+    items = load_requests()
+    if args.limit:
+        items = items[: args.limit]
+    minutes = getattr(args, "max_minutes", None)
+    started = time.monotonic()
+    budget = minutes * 60 if minutes else None
+    routes = []
+    ps: dict = {}
+    for item in items:
+        if budget is not None and time.monotonic() - started > budget:
+            routes.append(Route(item["peticion"], None, "omitida"))
+            continue
+        if decision:
+            route = route_request_decision(provider, item["peticion"], config.max_seconds)
+        else:
+            route = route_request(provider, item["peticion"], config.max_seconds, log_dir=results / "logs", label=f"{trial.label}_{item['id']}_v{args.env_variant}", root=work)
+        if not ps:
+            ps = ollama_ps(config.base_url, config.model)
+        routes.append(route)
+        ok = route.role == item["rol"]
+        rec.add(
+            RunRecord(
+                role=trial.label, model=config.model, case=item["id"], rep=1, success=ok, stop_reason="final" if route.status == "ok" else route.status, steps=1,
+                tokens=(route.prompt_tokens + route.completion_tokens) or None, prompt_tokens_last=route.prompt_tokens or None, seconds=route.seconds,
+                context_length=ps.get("context_length"), num_ctx_config=config.options.get("num_ctx"), processor=ps.get("processor", ""), cpu_offload=ps.get("cpu_offload"),
+                notes=f"verdad={item['rol']} elegido={route.role} [{route.status}] | {item['peticion'][:80]}",
+                details={"truth": item["rol"], "chosen": route.role, "status": route.status, "request": item["peticion"], "reply": route.reply, "probabilities": route.probabilities, "motivo": route.motivo},
+            )
+        )
+    truth = [i["rol"] for i in items]
+    chosen = [r.role for r in routes]
+    matrix = confusion_matrix(truth, chosen)
+    metrics = role_metrics(matrix)
+    asked = [r for r in routes if r.status != "omitida"]
+    omitted = len(routes) - len(asked)
+    format_failures = sum(r.status in {"formato", "vacia"} for r in routes)
+    request_failures = sum(r.status in {"timeout", "error"} for r in routes)
+    mean_s = round(sum(r.seconds for r in asked) / len(asked), 2) if asked else 0.0
+    c = CRITERIA["router"]
+    per_role = metrics["per_role"]
+    present = [r for r in ROUTER_ROLES if per_role[r]["n"]]
+    wrong = [f"{i['id']} ({i['rol']} -> {r.role or NO_ROLE})" for i, r in zip(items, routes) if r.role != i["rol"]]
+    notes = [
+        f"Exactitud {100 * metrics['accuracy']:.1f} % ({metrics['correct']}/{metrics['total']}); fallos de formato {format_failures}; fallos de petición (tiempo o servidor) {request_failures}; {mean_s} s por petición; procesador {ps.get('processor') or 'desconocido'}.",
+        "Matriz de confusión (verdad -> rol elegido): "
+        + " | ".join(f"{t}: " + ", ".join(f"{p} {n}" for p, n in matrix[t].items() if n) for t in ROUTER_ROLES if sum(matrix[t].values())) + ".",
+        "Recall / precisión por rol: " + "; ".join(f"{r} {per_role[r]['correct']}/{per_role[r]['n']} / {'-' if per_role[r]['precision'] is None else f'{100 * per_role[r]['precision']:.0f} %'}" for r in present) + ".",
+        f"Peticiones mal encaminadas ({len(wrong)}): {', '.join(wrong) or 'ninguna'}.",
+        "Aviso: el conjunto lo ha escrito el mismo autor del experimento, a partir de las definiciones de los roles: posible sesgo de coherencia con ellas.",
+    ]
+    if omitted:
+        notes.append(f"PROTOCOLO INCOMPLETO: {omitted} peticiones sin hacer por el presupuesto de tiempo ({minutes:g} min).")
+    return {
+        "metrics": {
+            **metrics, "confusion": matrix, "confusion_table": matrix_table(matrix), "format_failures": format_failures, "request_failures": request_failures, "omitted": omitted,
+            "seconds_per_request_mean": mean_s, "processor": ps.get("processor"), "decision_model": decision, "misrouted": wrong,
+        },
+        "notes": notes,
+        "criteria": [
+            ("Exactitud global", f">= {100 * c['accuracy_min']:.0f} %", f"{100 * metrics['accuracy']:.1f} % ({metrics['correct']}/{metrics['total']})", metrics["total"] > 0 and omitted == 0 and metrics["accuracy"] >= c["accuracy_min"]),
+            ("Recall en cada rol (mínimo)", f">= {100 * c['recall_min']:.0f} %", "; ".join(f"{r} {per_role[r]['correct']}/{per_role[r]['n']}" for r in present) or "-", bool(present) and omitted == 0 and all(per_role[r]["recall"] >= c["recall_min"] for r in present)),
+        ],
+    }
+
+
 # -- salida ------------------------------------------------------------------------------------------------------------
 def runs_table(runs: list[RunRecord]) -> str:
     lines = [
@@ -1517,6 +1793,8 @@ EVALUATORS = {
     "summarizer": eval_summarizer,
     "retriever": eval_retriever,
     "retriever_hybrid": functools.partial(eval_retriever, role="retriever_hybrid"),
+    "query_rewriter": eval_query_rewriter,
+    "router": eval_router,
 }
 
 
@@ -1605,7 +1883,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provider", help="cambia el proveedor del rol evaluado (p. ej. ollama_systemone para un modelo de decisión como tev1)")
     parser.add_argument("--think", choices=["true", "false"], help="fija options.think del rol evaluado (razonamiento de los modelos que lo admiten)")
     parser.add_argument("--max-seconds", dest="max_seconds", type=float, help="tope de tiempo (s) de cada petición del rol evaluado")
-    parser.add_argument("--max-minutes", dest="max_minutes", type=float, help="solo doc_checker_pairs*, code_reviewer_funcs y retriever*: presupuesto de tiempo de la evaluación (no se empieza una repetición que no quepa)")
+    parser.add_argument("--max-minutes", dest="max_minutes", type=float, help="solo doc_checker_pairs*, code_reviewer_funcs, retriever*, query_rewriter y router: presupuesto de tiempo de la evaluación (no se empieza una repetición que no quepa)")
     parser.add_argument("--reps", type=int, help="solo para pruebas rápidas: sustituye las repeticiones del protocolo")
     parser.add_argument("--limit", type=int, help="solo para pruebas rápidas: primeros N casos")
     parser.add_argument("--drop", action="append", help="solo diagnóstico del retriever: quita de la copia los ficheros que cumplan este patrón (repetible)")

@@ -293,6 +293,50 @@ definition_fallback = "retriever"
 [agents.retriever_hybrid.options]
 num_ctx = 2048
 
+# Reescritor de consultas para BM25 (amp_agents.rewrite, diseño fijado el 2026-11-06): una petición sin herramientas por pregunta, con salida
+# restringida ({"palabras": [3 a 8 strings]}, esquema REWRITE_FORMAT_SCHEMA) y temperatura 0; la consulta final es la pregunta + las palabras.
+# El mensaje de sistema es fijo y vive en amp_agents.rewrite. Criterios NUEVOS en eval_roles.CRITERIA["query_rewriter"]. Otros modelos con
+# `eval_roles query_rewriter --model ...` (llama3.2:3b por defecto; gemma3:4b; phi4-mini).
+[agents.query_rewriter]
+mode = "single_shot"
+provider = "ollama"
+model = "llama3.2:3b"
+base_url = "http://localhost:11434"
+timeout = 60
+max_seconds = 60
+max_tokens = 96
+tools = []
+read = ["context", "src"]
+write = []
+definition_fallback = "retriever"
+
+[agents.query_rewriter.options]
+num_ctx = 2048
+temperature = 0
+format = { type = "object", properties = { palabras = { type = "array", items = { type = "string" }, minItems = 3, maxItems = 8 } }, required = ["palabras"] }
+
+# Enrutador de peticiones (amp_agents.router, diseño fijado el 2026-11-06): elige UNO de seis roles (locator, summarizer, code_reviewer, retriever,
+# doc_checker, executor) con salida restringida ({"rol": enum}, esquema ROUTER_FORMAT_SCHEMA), temperatura 0. Mensaje de sistema fijo en
+# amp_agents.router. Criterios NUEVOS en eval_roles.CRITERIA["router"]. Otros modelos con `eval_roles router --model ...` (phi4-mini, gemma3:4b,
+# lfm3:1.7b con --think false) y el de decisión tev1 con `--provider ollama_systemone` (pregunta de tipo choice).
+[agents.router]
+mode = "single_shot"
+provider = "ollama"
+model = "llama3.2:3b"
+base_url = "http://localhost:11434"
+timeout = 60
+max_seconds = 60
+max_tokens = 32
+tools = []
+read = ["context", "src"]
+write = []
+definition_fallback = "orchestrator"
+
+[agents.router.options]
+num_ctx = 2048
+temperature = 0
+format = { type = "object", properties = { rol = { type = "string", enum = ["locator", "summarizer", "code_reviewer", "retriever", "doc_checker", "executor"] } }, required = ["rol"] }
+
 # --- Ejemplos (descomenta y ajusta) -------------------------------------------------------------
 # Otro modelo local en Ollama (misma definición, mismo encargo):
 #

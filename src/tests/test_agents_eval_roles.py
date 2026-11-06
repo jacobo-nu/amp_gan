@@ -32,6 +32,8 @@ def test_declared_criteria_match_the_protocol():
         "code_reviewer": {"recovered_mean_min": 3.0, "valid_citations_min": 0.90, "false_positives_max": 2},
         "summarizer": {"numbers_min": 0.95, "max_words": 150},
         "retriever": {"top3_min": 0.80},
+        "query_rewriter": {"gain_min": 2, "regressions_max": 1},  # criterios nuevos, fijados el 2026-11-06 antes de medir
+        "router": {"accuracy_min": 0.85, "recall_min": 0.60},
     }
     assert E.REPS == {"locator": 2, "doc_checker": 3, "code_reviewer": 3, "summarizer": 3}
     assert E.ROLES == ("doc_checker", "code_reviewer", "summarizer", "retriever")  # el localizador está retirado de `all`

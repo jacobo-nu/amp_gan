@@ -435,6 +435,39 @@ class SystemOneProvider(ChatProvider):
         return out
 
 
+    def choose(self, state: str, instructions: str, criteria: dict[str, str], timeout: float | None = None, name: str = "eleccion") -> tuple[str, dict[str, float]]:
+        """Pregunta de tipo ``choice``: ``(opción elegida, probabilidades)`` para las opciones de ``criteria`` (nombre -> descripción).
+
+        El cuerpo es ``{"model", "state", "questions": {name: {"type": "choice", "instructions", "criteria"}}}`` y la respuesta
+        ``{"answers": {name: {"type": "choice", "choice", "probabilities": {opción: p}}}}``. La opción devuelta es la de MAYOR
+        probabilidad (a igual probabilidad, la primera de ``criteria``); si la respuesta no trae probabilidades se usa ``choice``.
+        Una opción que no esté en ``criteria``, o probabilidades que no sean números entre 0 y 1, es un :class:`ProviderError`.
+        """
+        if len(criteria) < 2:
+            raise ProviderError("choose necesita al menos dos opciones")
+        body = {"model": self.model, "state": state, "questions": {name: {"type": "choice", "instructions": instructions, "criteria": dict(criteria)}}}
+        limit = self.timeout if timeout is None else min(self.timeout, timeout)
+        data = post_json(f"{self.base_url}/v1/systemone", body, self.base_url, limit)
+        answers = data.get("answers") if isinstance(data, dict) else None
+        item = answers.get(name) if isinstance(answers, dict) else None
+        if not isinstance(item, dict):
+            raise ProviderError(f"respuesta sin answers.{name}: {str(data)[:200]}")
+        probabilities = item.get("probabilities")
+        if isinstance(probabilities, dict) and probabilities:
+            clean: dict[str, float] = {}
+            for option in criteria:
+                value = probabilities.get(option)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
+                    raise ProviderError(f"probabilidad no válida para la opción {option!r}: {str(probabilities)[:200]}")
+                clean[option] = float(value)
+            best = max(criteria, key=lambda option: (clean[option], -list(criteria).index(option)))
+            return best, clean
+        choice = item.get("choice")
+        if choice not in criteria:
+            raise ProviderError(f"opción no válida en la respuesta: {str(item)[:200]}")
+        return choice, {}
+
+
 class ScriptedProvider(ChatProvider):
     """Proveedor de tests: devuelve las respuestas predefinidas en orden, sin red.
 

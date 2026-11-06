@@ -577,19 +577,85 @@ def decimal_comma(text: str, source: str | None = None) -> str:
     return "".join(part if i % 2 else _DOT_DECIMAL_RE.sub(swap, part) for i, part in enumerate(parts))
 
 
-def postprocess_summary(text: str, source: str | None = None, max_words: int = 150) -> tuple[str, dict]:
-    """Corrección por código de un resumen: coma decimal y recorte a ``max_words``. Devuelve ``(texto, info)``.
+FILTER_MIN_WORDS = 30  # un resumen filtrado con menos palabras (o vacío) es un fallo de formato (fijado antes de medir)
+
+
+def sentence_spans(text: str) -> list[tuple[int, int]]:
+    """Frases de ``text`` como ``(inicio, fin)`` de caracteres: la frase acaba en el trozo que cierra :func:`_is_sentence_end` y el
+    resto del texto, si lo hay, es la última frase. No se parten abreviaturas («p. ej.») ni marcadores de lista («1.»)."""
+    body = text or ""
+    tokens = list(re.finditer(r"\S+", body))
+
+    def ends(i: int) -> bool:
+        if _is_sentence_end(i, tokens):
+            return True
+        word = tokens[i].group(0).strip("*_(\"“«")
+        if len(word) == 2 and word[0].isalpha() and word[1] == "." and i + 1 < len(tokens):  # unidad al final de frase («3,2 s. Otra...»)
+            following = tokens[i + 1].group(0).lstrip("*_(\"“«¿¡")[:1]
+            return following.isupper() or "\n" in body[tokens[i].end() : tokens[i + 1].start()]
+        return False
+
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for i, match in enumerate(tokens):
+        if start is None:
+            start = match.start()
+        if ends(i):
+            spans.append((start, match.end()))
+            start = None
+    if start is not None:
+        spans.append((start, tokens[-1].end()))
+    return spans
+
+
+def filter_unsupported_sentences(text: str, source: str) -> tuple[str, dict]:
+    """Quita de ``text`` las frases que contienen alguna cifra NO respaldada por ``source`` (paso determinista, sin modelo).
+
+    Una cifra está respaldada según :func:`number_supported` (la misma comprobación que :func:`check_numbers_supported`). Las frases
+    sin cifras se conservan; los separadores (espacios y saltos de párrafo) de las frases que quedan son los originales. Devuelve
+    ``(texto, info)`` con ``sentences`` (total), ``removed`` (cuántas se quitan), ``removed_texts`` y ``words_before`` / ``words_after``.
+    Si no queda ninguna frase, el texto es la cadena vacía.
+    """
+    body = text or ""
+    reference = extract_numbers(source) + extract_numbers(source, comma_decimal=False)
+    spans = sentence_spans(body)
+    kept: list[str] = []
+    removed: list[str] = []
+    previous_end = 0
+    for start, end in spans:
+        sentence = body[start:end]
+        if all(number_supported(n, reference) for n in extract_numbers(sentence)):
+            kept.append((body[previous_end:start] if kept else "") + sentence)
+        else:
+            removed.append(sentence)
+        previous_end = end
+    filtered = "".join(kept).strip()
+    return filtered, {"sentences": len(spans), "removed": len(removed), "removed_texts": removed, "words_before": count_words(body), "words_after": count_words(filtered)}
+
+
+def postprocess_summary(text: str, source: str | None = None, max_words: int = 150, filter_numbers: bool = False) -> tuple[str, dict]:
+    """Corrección por código de un resumen: coma decimal y recorte a ``max_words`` y, opcionalmente, filtro de cifras. ``(texto, info)``.
 
     ``info``: ``mode`` del recorte (``intacto``/``frase``/``palabras``), ``words_before`` y ``words_after``, y, con
     ``source``, las cifras respaldadas antes y después (``numbers_before``/``numbers_after``). El recorte va primero
     sobre el texto ya con coma decimal; las cifras se comparan con la entrada con :func:`check_numbers_supported`,
     que admite coma o punto decimal en el resumen.
+
+    Con ``filter_numbers=True`` (y ``source``), DESPUÉS del recorte se quitan las frases con cifras no respaldadas
+    (:func:`filter_unsupported_sentences`); ``info["filter"]`` lo detalla y ``numbers_after`` / ``words_after`` son los del texto final
+    (``numbers_trimmed`` / ``words_trimmed``, los del texto solo recortado). Al ser código, el cumplimiento depende del filtro y no del modelo.
     """
     commas = decimal_comma(text, source)
     fixed, mode = trim_summary_with_mode(commas, max_words)
     info: dict = {"mode": mode, "words_before": count_words(text), "words_after": count_words(fixed)}
     if source is not None:
         info["numbers_before"] = check_numbers_supported(text, source)
+    if filter_numbers and source is not None:
+        info["words_trimmed"] = info["words_after"]
+        info["numbers_trimmed"] = check_numbers_supported(fixed, source)
+        fixed, info["filter"] = filter_unsupported_sentences(fixed, source)
+        info["words_after"] = count_words(fixed)
+    if source is not None:
         info["numbers_after"] = check_numbers_supported(fixed, source)
     return fixed, info
 

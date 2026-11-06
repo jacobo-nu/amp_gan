@@ -311,7 +311,7 @@ def test_cli_summarizer_reads_files_with_the_policy_and_checks_numbers(tmp_path,
     assert "### context/data/processed/m.csv" in sent and "0.4321" in sent
     scripted = ScriptedProvider(["La pérdida fue de 0,99 en el conjunto de datos de la época 200 y se mantuvo."])
     monkeypatch.setattr(R, "make_provider", lambda config: scripted)
-    code = R.main(["--agent", "summarizer", "context/data/processed/m.csv", "--root", str(project), "--log-dir", str(tmp_path / "l")])
+    code = R.main(["--agent", "summarizer", "context/data/processed/m.csv", "--root", str(project), "--log-dir", str(tmp_path / "l"), "--no-filter-numbers"])
     assert code == 1 and "cifras que no están en la entrada" in capsys.readouterr().err
     assert R.main(["--agent", "summarizer", ".env", "--root", str(project)]) == 2  # la política deniega leerlo
     assert R.main(["--agent", "summarizer", "--root", str(project)]) == 2

@@ -1,0 +1,245 @@
+{
+ "nota": "48 peticiones etiquetadas (8 por rol), escritas el 2026-11-06 a partir de las definiciones de los roles y ANTES de ver ninguna salida de modelo. Las escribió el mismo autor del experimento: puede haber sesgo de coherencia con las definiciones.",
+ "peticiones": [
+  {
+   "id": "r01",
+   "rol": "locator",
+   "peticion": "¿En qué fichero está definida la clase Policy?"
+  },
+  {
+   "id": "r02",
+   "rol": "summarizer",
+   "peticion": "Resume en pocas frases cómo evolucionaron las métricas de la cgan_hydro durante el entrenamiento."
+  },
+  {
+   "id": "r03",
+   "rol": "code_reviewer",
+   "peticion": "Revisa src/amp_gan/properties.py y dime si ves errores de programación."
+  },
+  {
+   "id": "r04",
+   "rol": "retriever",
+   "peticion": "¿Qué dice la documentación sobre cómo se elige el backend?"
+  },
+  {
+   "id": "r05",
+   "rol": "doc_checker",
+   "peticion": "Compara roadmap.md y TODO.md y dime si alguna cifra no coincide."
+  },
+  {
+   "id": "r06",
+   "rol": "executor",
+   "peticion": "Añade un test para la función hydrophobicity."
+  },
+  {
+   "id": "r07",
+   "rol": "locator",
+   "peticion": "Necesito saber qué módulos de src importan amp_gan.conditions."
+  },
+  {
+   "id": "r08",
+   "rol": "summarizer",
+   "peticion": "Aquí tienes el run_info.json y el CSV de métricas de la longitud; cuéntame qué pasó en el experimento."
+  },
+  {
+   "id": "r09",
+   "rol": "code_reviewer",
+   "peticion": "¿Hay algún índice desplazado o una comparación al revés en este módulo?"
+  },
+  {
+   "id": "r10",
+   "rol": "retriever",
+   "peticion": "¿Qué reglas siguen las ramas y los commits del proyecto?"
+  },
+  {
+   "id": "r11",
+   "rol": "doc_checker",
+   "peticion": "Comprueba que las fechas del README concuerdan con las del roadmap."
+  },
+  {
+   "id": "r12",
+   "rol": "executor",
+   "peticion": "Cambia el valor por defecto de pH a 7.0 en net_charge y actualiza los tests."
+  },
+  {
+   "id": "r13",
+   "rol": "locator",
+   "peticion": "¿Por dónde aparece la constante PKA en el código?"
+  },
+  {
+   "id": "r14",
+   "rol": "summarizer",
+   "peticion": "Hazme un resumen de unas 100 palabras de los resultados del último entrenamiento."
+  },
+  {
+   "id": "r15",
+   "rol": "code_reviewer",
+   "peticion": "Mira esta función a ver si falta alguna validación de entrada."
+  },
+  {
+   "id": "r16",
+   "rol": "retriever",
+   "peticion": "Busca en los documentos qué criterio se fijó para la condicional por longitud."
+  },
+  {
+   "id": "r17",
+   "rol": "doc_checker",
+   "peticion": "¿Se contradicen estos dos documentos en el estado de la tarea de la WGAN-GP?"
+  },
+  {
+   "id": "r18",
+   "rol": "executor",
+   "peticion": "Implementa un script de descarga de los datos en src/amp_gan."
+  },
+  {
+   "id": "r19",
+   "rol": "locator",
+   "peticion": "Dime la línea exacta donde se declara fit_condition_spec."
+  },
+  {
+   "id": "r20",
+   "rol": "summarizer",
+   "peticion": "Explícame con tus palabras qué dicen estas tablas de resultados."
+  },
+  {
+   "id": "r21",
+   "rol": "code_reviewer",
+   "peticion": "Échale un ojo a data.py: sospecho que hay un caso límite sin tratar."
+  },
+  {
+   "id": "r22",
+   "rol": "retriever",
+   "peticion": "¿Cuál es el rango de longitud de las secuencias de entrenamiento según el stack técnico?"
+  },
+  {
+   "id": "r23",
+   "rol": "doc_checker",
+   "peticion": "Mira si el TODO menciona algún fichero con un nombre distinto al que aparece en el roadmap."
+  },
+  {
+   "id": "r24",
+   "rol": "executor",
+   "peticion": "Corrige el error de data.py y ejecuta pytest para comprobarlo."
+  },
+  {
+   "id": "r25",
+   "rol": "locator",
+   "peticion": "¿Quién usa la función net_charge fuera del módulo donde está?"
+  },
+  {
+   "id": "r26",
+   "rol": "summarizer",
+   "peticion": "¿Puedes condensar las métricas finales de este experimento en un párrafo?"
+  },
+  {
+   "id": "r27",
+   "rol": "code_reviewer",
+   "peticion": "¿Se han intercambiado los argumentos en alguna de estas llamadas? Mira el fichero a ver si cuadra."
+  },
+  {
+   "id": "r28",
+   "rol": "retriever",
+   "peticion": "¿De dónde proceden los datos y con qué licencia?"
+  },
+  {
+   "id": "r29",
+   "rol": "doc_checker",
+   "peticion": "Verifica que el número de tests que anuncia la documentación es el mismo en todos los sitios."
+  },
+  {
+   "id": "r30",
+   "rol": "executor",
+   "peticion": "Renombra la función evaluate_target a evaluate_condition en todo el código."
+  },
+  {
+   "id": "r31",
+   "rol": "locator",
+   "peticion": "Estoy perdido: ¿en qué archivo vive evaluate_target?"
+  },
+  {
+   "id": "r32",
+   "rol": "summarizer",
+   "peticion": "Redacta una descripción breve de lo que muestran los ficheros de resultados de la WGAN-GP."
+  },
+  {
+   "id": "r33",
+   "rol": "code_reviewer",
+   "peticion": "Quiero una segunda opinión sobre este script: ¿hay fallos lógicos?"
+  },
+  {
+   "id": "r34",
+   "rol": "retriever",
+   "peticion": "Recuérdame qué permisos tiene el ejecutor según su definición."
+  },
+  {
+   "id": "r35",
+   "rol": "doc_checker",
+   "peticion": "Contrasta la definición del ejecutor con la gobernanza y señala lo que choque."
+  },
+  {
+   "id": "r36",
+   "rol": "executor",
+   "peticion": "Escribe un módulo nuevo que lea ficheros FASTA y pásale los tests."
+  },
+  {
+   "id": "r37",
+   "rol": "locator",
+   "peticion": "¿Hay algún sitio donde se emplee HYDRO_HIT_TOLERANCE además de su definición?"
+  },
+  {
+   "id": "r38",
+   "rol": "summarizer",
+   "peticion": "Dame la película de la corrida: cómo bajó la pérdida y cuánto tardó cada época."
+  },
+  {
+   "id": "r39",
+   "rol": "code_reviewer",
+   "peticion": "Comprueba que el signo de la carga neta está bien en el código."
+  },
+  {
+   "id": "r40",
+   "rol": "retriever",
+   "peticion": "¿Qué preguntas de investigación plantea la misión del proyecto?"
+  },
+  {
+   "id": "r41",
+   "rol": "doc_checker",
+   "peticion": "Hay dos versiones de este informe; ¿en qué puntos se desdicen?"
+  },
+  {
+   "id": "r42",
+   "rol": "executor",
+   "peticion": "Refactoriza train_step para que use menos memoria y comprueba que sigue funcionando."
+  },
+  {
+   "id": "r43",
+   "rol": "locator",
+   "peticion": "Encuentra la función que calcula el GRAVY y dime su ruta."
+  },
+  {
+   "id": "r44",
+   "rol": "summarizer",
+   "peticion": "Necesito un párrafo para el informe que cuente los números de este run, sin valorar si cumple los criterios."
+  },
+  {
+   "id": "r45",
+   "rol": "code_reviewer",
+   "peticion": "Audita este fichero de Python buscando bugs, sin comentarios de estilo."
+  },
+  {
+   "id": "r46",
+   "rol": "retriever",
+   "peticion": "¿Qué decidimos sobre el recuperador por defecto, BM25 o embeddings?"
+  },
+  {
+   "id": "r47",
+   "rol": "doc_checker",
+   "peticion": "Revisa que lo marcado como hecho en un documento no figure como pendiente en el otro."
+  },
+  {
+   "id": "r48",
+   "rol": "executor",
+   "peticion": "Haz que el notebook 04 acepte el número de épocas por línea de órdenes."
+  }
+ ]
+}

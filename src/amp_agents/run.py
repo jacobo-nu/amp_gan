@@ -32,6 +32,10 @@ Opciones:
                    úsese una copia para pruebas
     --log-dir      carpeta de registros JSONL (por defecto ``<root>/.agent_runs``)
     --config       otro ``agents.toml``
+    --raw          resumidor y revisor de código: muestra la salida del modelo SIN corregir. Por defecto el resumen pasa por
+                   ``postprocess_summary`` (coma decimal, recorte a 150 palabras y, con ``--filter-numbers``, filtro de las frases con cifras
+                   no respaldadas) y el informe del revisor por ``correct_review_lines`` (línea de cada hallazgo = la de su cita literal);
+                   la salida de error dice qué se corrigió
     --k, --lexical, --embedding, --hybrid, --build-index   solo ``retriever`` (nº de resultados; BM25 léxico, que es lo que se
                    usa por defecto según ``search_backend``; embeddings, que exigen el servidor y el índice; fusión híbrida BM25 +
                    embeddings por rango recíproco, que también los exige; reconstruir el índice)
@@ -72,7 +76,13 @@ from .retrieval import (
     save_index,
     search,
 )
-from .verifiers import Verification, verify
+from .verifiers import FILTER_MIN_WORDS, Verification, correct_review_lines, count_words, decimal_comma, parse_json_output, postprocess_summary, verify
+
+# Si el filtro de cifras no respaldadas se aplica por defecto al resumen de la CLI. REGLA fijada el 2026-11-06 antes de medirlo: solo si el
+# resumidor configurado (gemma3:4b) cumple los tres criterios de ``CRITERIA["summarizer"]`` con recorte + filtro y sin fallos de formato
+# en la evaluación ``p4``. Siempre se puede forzar con ``--filter-numbers`` / ``--no-filter-numbers``.
+FILTER_NUMBERS_BY_DEFAULT = True  # evaluación p4 (2026-11-06): gemma3:4b cumplió los tres criterios con recorte + filtro y 0 fallos de formato en 10 ejecuciones
+SUMMARY_MAX_WORDS = 150
 
 TASK_SECTIONS = ("Tarea", "Contexto", "Entregable", "Aceptación", "Restricciones")
 
@@ -245,6 +255,47 @@ def prepare_task(agent: str, inputs: list[str], root: Path, note: str = "", max_
     raise ConfigError(f"el agente {agent!r} no tiene constructor de mensaje: usa --task-file")
 
 
+def postprocess_output(verifier: str, report: str, context: dict, filter_numbers: bool = FILTER_NUMBERS_BY_DEFAULT) -> tuple[str, list[str], bool]:
+    """Corrección por código de la salida de un rol: ``(texto, avisos, ok)``; ``avisos`` dice QUÉ se corrigió.
+
+    - ``summarizer``: ``postprocess_summary`` (coma decimal y recorte a 150 palabras y, con ``filter_numbers``, quita las frases con cifras
+      no respaldadas por la entrada). ``ok`` es falso si el filtro quitó alguna frase y deja menos de 30 palabras (fallo de formato; en la evaluación cuenta también un resumen corto sin frases quitadas).
+    - ``code_reviewer``: ``correct_review_lines`` (la línea de cada hallazgo pasa a la de su cita literal más cercana; los hallazgos cuya
+      cita no está en el fichero quedan marcados ``verificable: false``, sin inventarles línea). Si la salida no es JSON con ``hallazgos``
+      no se toca.
+    - cualquier otro verificador: sin cambios.
+    """
+    if verifier == "summarizer" and "source" in context:
+        source = context["source"]
+        fixed, info = postprocess_summary(report, source, SUMMARY_MAX_WORDS, filter_numbers=filter_numbers)
+        notes = []
+        if decimal_comma(report, source) != report:
+            notes.append("coma decimal: se cambió el punto decimal de algún número")
+        if info["mode"] != "intacto":
+            notes.append(f"recorte ({info['mode']}): de {info['words_before']} a {info['words_trimmed'] if 'words_trimmed' in info else info['words_after']} palabras (máximo {SUMMARY_MAX_WORDS})")
+        ok = True
+        if filter_numbers:
+            removed = info["filter"]["removed"]
+            notes.append(f"filtro de cifras: {removed} de {info['filter']['sentences']} frases quitadas por tener cifras no respaldadas" + (f" ({'; '.join(t[:60] for t in info['filter']['removed_texts'])})" if removed else ""))
+            if removed and count_words(fixed) < FILTER_MIN_WORDS:  # solo si el filtro quitó algo: un resumen corto de por sí no es culpa del filtro
+                ok = False
+                notes.append(f"FALLO DE FORMATO: tras el filtro el resumen tiene {count_words(fixed)} palabras (mínimo {FILTER_MIN_WORDS})")
+        before, after = info["numbers_before"], info["numbers_after"]
+        notes.append(f"cifras respaldadas por la entrada: {before['supported']}/{before['total']} -> {after['supported']}/{after['total']}")
+        return fixed, notes, ok
+    if verifier == "code_reviewer" and "source" in context:
+        obj, _, error = parse_json_output(report)
+        if error or not isinstance(obj, dict) or not isinstance(obj.get("hallazgos"), list):
+            return report, ["salida sin JSON de hallazgos: no se corrigió nada"], True
+        corrected = correct_review_lines(obj, context["source"])
+        notes = [f"línea corregida a la de la cita literal: {corrected['corrected']} de {len(corrected['items'])} hallazgos"]
+        notes += [f"hallazgo {i['item']}: línea {i['linea_modelo']} -> {i['linea']}" for i in corrected["items"] if i["estado"] == "corregida"]
+        if corrected["unverifiable"]:
+            notes.append(f"{corrected['unverifiable']} hallazgos con la cita ausente del fichero (verificable: false; sin línea inventada)")
+        return json.dumps(corrected["obj"], ensure_ascii=False, indent=1), notes, True
+    return report, [], True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m amp_agents.run", description="Ejecuta un agente con un modelo configurable.")
     parser.add_argument("inputs", nargs="*", help="pregunta o rutas, según el rol")
@@ -264,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--embedding", action="store_true", help="solo retriever: embeddings (necesita el índice y el servidor de modelos)")
     parser.add_argument("--hybrid", action="store_true", help="solo retriever: BM25 + embeddings por rango recíproco (necesita el índice y el servidor de modelos)")
     parser.add_argument("--build-index", dest="build_index", action="store_true")
+    parser.add_argument("--raw", action="store_true", help="resumidor y revisor: muestra la salida del modelo sin corregir")
+    parser.add_argument("--filter-numbers", dest="filter_numbers", action=argparse.BooleanOptionalAction, default=None, help="resumidor: quita las frases con cifras no respaldadas (por defecto, según FILTER_NUMBERS_BY_DEFAULT)")
     args = parser.parse_args(argv)
     try:
         config = get_agent_config(args.agent, args.config)
@@ -300,7 +353,15 @@ def main(argv: list[str] | None = None) -> int:
     except (ConfigError, ProviderError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(result.report)
+    shown, ok_format = result.report, True
+    if config.verifier in {"summarizer", "code_reviewer"} and result.stop_reason == "final" and not args.raw:
+        use_filter = FILTER_NUMBERS_BY_DEFAULT if args.filter_numbers is None else args.filter_numbers
+        shown, notes, ok_format = postprocess_output(config.verifier, result.report, context, use_filter)
+        for line in notes:
+            print(f"corrección: {line}", file=sys.stderr)
+    elif args.raw and config.verifier in {"summarizer", "code_reviewer"}:
+        print("salida cruda (--raw): sin corregir", file=sys.stderr)
+    print(shown)
     tokens = "sin datos" if result.tokens is None else f"{result.tokens.total_tokens}"
     print(
         f"[{result.stop_reason}] pasos={result.steps} tokens={tokens} tiempo={result.duration_s:.1f}s "
@@ -311,9 +372,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {result.error}", file=sys.stderr)
     ok = result.stop_reason == "final"
     if config.verifier and ok:
-        check = verify(config.verifier, result.report, root=base, **context)
-        print(f"verificación: {'válida' if check.valid else 'NO válida: ' + '; '.join(check.errors)}", file=sys.stderr)
-        ok = check.valid
+        check = verify(config.verifier, shown, root=base, **context)
+        print(f"verificación{' (salida cruda)' if args.raw else ''}: {'válida' if check.valid else 'NO válida: ' + '; '.join(check.errors)}", file=sys.stderr)
+        ok = check.valid and ok_format
     return 0 if ok else 1
 
 
