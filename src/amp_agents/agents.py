@@ -37,7 +37,7 @@ PROVIDER_NAMES = ("ollama", "ollama_systemone") + OPENAI_COMPAT_PROVIDERS  # oll
 MODES = ("agent", "single_shot", "embedding")
 WRITE_TOOLS = ("write_file", "edit_file")
 EXTRA_TOOLS = ("search_docs",)  # herramientas que no están en tools.ALL_TOOLS (se construyen con la configuración)
-SEARCH_BACKENDS = ("lexical", "embedding")
+SEARCH_BACKENDS = ("lexical", "embedding", "hybrid")
 JSON_ROLES = ("locator", "doc_checker", "code_reviewer")  # valores de ``verifier`` con salida JSON (con o sin herramientas)
 
 DATA_NOTICE = """\
@@ -96,7 +96,7 @@ class AgentConfig:
     mode: str = "agent"             # "agent" | "single_shot" | "embedding"
     verifier: str = ""              # nombre del verificador de amp_agents.verifiers ("" = ninguno)
     index_dir: str = DEFAULT_INDEX_DIR   # índice de embeddings (para search_docs y para el recuperador)
-    search_backend: str = "lexical"      # "lexical" | "embedding": qué usa la herramienta search_docs
+    search_backend: str = "lexical"      # "lexical" | "embedding" | "hybrid" (BM25 + embeddings por RRF): qué usa search_docs y el recuperador
     env_variant: int = 1            # variante de la sección «Entorno de ejecución» (ver ENV_VARIANT_NOTES)
     definition_fallback: str = ""   # definición a usar si falta context/agents/<rol>.md (p. ej. la de otro rol del que es variante)
 
@@ -337,13 +337,13 @@ def make_policy(config: AgentConfig, root: str | Path | None = None) -> Policy:
 def make_tools(config: AgentConfig, config_path: str | Path | None = None, embedder=None) -> list[Tool]:
     """Herramientas habilitadas para el agente (exactamente las de ``config.tools``, en ese orden).
 
-    ``search_docs`` se construye con ``search_backend`` e ``index_dir``; con el backend ``embedding`` usa el modelo
+    ``search_docs`` se construye con ``search_backend`` e ``index_dir``; con el backend ``embedding`` o ``hybrid`` usa el modelo
     del rol ``retriever`` de la configuración (o ``embedder`` si se pasa uno, p. ej. en tests).
     """
     tools: list[Tool] = []
     for name in config.tools:
         if name == "search_docs":
-            if config.search_backend == "embedding" and embedder is None:
+            if config.search_backend in {"embedding", "hybrid"} and embedder is None:
                 retriever = get_agent_config("retriever", config_path)
                 embedder = make_provider(retriever)
             tools.append(search_docs_tool(config.search_backend, config.index_dir, embedder))

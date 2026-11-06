@@ -36,7 +36,7 @@ def test_config_file_has_commented_examples_for_other_models():
     text = (SRC / "amp_agents" / "agents.toml").read_text(encoding="utf-8")
     assert "# [agents.executor_14b]" in text and "# [agents.executor_server]" in text
     assert "llama.cpp" in text and "vLLM" in text
-    assert list(load_config()["agents"]) == ["executor", "locator", "doc_checker", "doc_checker_ss", "doc_checker_pairs", "code_reviewer", "summarizer", "retriever"]
+    assert list(load_config()["agents"]) == ["executor", "locator", "doc_checker", "doc_checker_ss", "doc_checker_pairs", "doc_checker_pairs_short", "doc_checker_pairs_json", "doc_checker_pairs_agree", "code_reviewer", "code_reviewer_funcs", "summarizer", "retriever", "retriever_hybrid"]
 
 
 def test_config_errors(tmp_path):

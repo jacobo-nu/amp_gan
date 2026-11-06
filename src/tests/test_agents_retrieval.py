@@ -417,3 +417,209 @@ def test_search_docs_tool_of_a_default_role_is_lexical_and_needs_no_embedder(tmp
     out = tool.run(A.make_policy(cfg, root), {"query": "gobernanza ramas", "k": 1})
     assert out.ok and out.content.startswith("context/agents/otro.md:1")
     assert not (root / ".agent_runs").exists()
+
+
+# -- prefijos por modelo e índice ligado a su modelo -------------------------------------------------------------------------
+def test_prefixes_depend_on_the_model_and_nomic_keeps_its_own():
+    assert RT.prefixes_for("nomic-embed-text") == (RT.DOC_PREFIX, RT.QUERY_PREFIX)
+    assert RT.prefixes_for("nomic-embed-text:latest") == (RT.DOC_PREFIX, RT.QUERY_PREFIX) and RT.prefixes_for("NOMIC-EMBED-TEXT:v1.5") == (RT.DOC_PREFIX, RT.QUERY_PREFIX)
+    assert RT.prefixes_for("") == (RT.DOC_PREFIX, RT.QUERY_PREFIX) and RT.prefixes_for("m") == (RT.DOC_PREFIX, RT.QUERY_PREFIX)  # el comportamiento de siempre
+    assert RT.prefixes_for("bge-m3") == ("", "") and RT.prefixes_for("bge-m3:latest") == ("", "") and RT.prefixes_for("BGE-M3") == ("", "")
+
+
+def test_build_index_without_prefix_for_bge_m3_and_with_prefix_for_nomic():
+    bge, nomic = FakeEmbedder(), FakeEmbedder()
+    index = RT.build_index(CHUNKS, bge, model="bge-m3")
+    assert all(not t.startswith("search_") for c in bge.calls for t in c) and bge.calls[0][0].startswith("context/a.md\nEl backend")
+    assert index["model"] == "bge-m3" and index["doc_prefix"] == "" and index["query_prefix"] == ""
+    RT.build_index(CHUNKS, nomic, model="nomic-embed-text")
+    assert all(t.startswith("search_document: ") for c in nomic.calls for t in c)
+    retriever = RT.EmbeddingRetriever(index, bge)
+    retriever.search("backend", 1)
+    assert bge.calls[-1] == ["backend"]  # la consulta tampoco lleva prefijo con bge-m3
+    other = FakeEmbedder()
+    RT.EmbeddingRetriever(RT.build_index(CHUNKS, other, model="nomic-embed-text:latest"), other).search("backend", 1)
+    assert other.calls[-1] == ["search_query: backend"]
+
+
+def test_index_matches_only_the_model_it_was_built_with():
+    index = RT.build_index(CHUNKS, FakeEmbedder(), model="nomic-embed-text")
+    assert RT.index_matches(index, "nomic-embed-text") and RT.index_matches(index, "nomic-embed-text:latest")
+    assert not RT.index_matches(index, "bge-m3") and RT.index_matches(index, "")  # sin nombre no se puede comprobar
+    assert not RT.index_matches({"chunks": []}, "bge-m3")
+
+
+def test_retrieve_rebuilds_the_index_when_it_was_built_with_another_model(tmp_path):
+    from amp_agents.run import retrieve
+
+    root = _search_project(tmp_path)
+    fake = FakeEmbedder()
+    retrieve("backend AMP_GAN_BACKEND", root=root, k=1, lexical=False, embedder=fake)  # nomic-embed-text por defecto
+    folder = RT.resolve_index_dir(root)
+    assert RT.load_index(folder)["model"] == "nomic-embed-text"
+    calls = len(fake.calls)
+    retrieve("backend AMP_GAN_BACKEND", root=root, k=1, lexical=False, embedder=fake)
+    assert len(fake.calls) == calls + 1  # mismo modelo: se reutiliza (solo la consulta)
+    hits = retrieve("backend AMP_GAN_BACKEND", root=root, k=1, lexical=False, embedder=fake, model="bge-m3")
+    index = RT.load_index(folder)
+    assert index["model"] == "bge-m3" and index["query_prefix"] == "" and hits[0]["ruta"].endswith("tech_stack.md")
+    assert fake.calls[-1] == ["backend AMP_GAN_BACKEND"] and not fake.calls[-2][0].startswith("search_document")  # se reindexó sin prefijo
+
+
+# -- fusión híbrida (RRF) ------------------------------------------------------------------------------------------------------
+def _hit(name, line=1, text=None):
+    return RT.Hit(name, line, 0.0, text or name)
+
+
+def test_reciprocal_rank_fusion_sums_one_over_k_plus_rank_with_equal_weights():
+    a, b, c, d = _hit("a"), _hit("b"), _hit("c"), _hit("d")
+    fused = RT.reciprocal_rank_fusion([[a, b, c], [c, a, d]], k_rrf=60)
+    scores = {h.ruta: h.puntuacion for h in fused}
+    assert scores["a"] == pytest.approx(1 / 61 + 1 / 62) and scores["c"] == pytest.approx(1 / 63 + 1 / 61)
+    assert scores["b"] == pytest.approx(1 / 62) and scores["d"] == pytest.approx(1 / 63)
+    assert [h.ruta for h in fused] == ["a", "c", "b", "d"]  # a (1/61+1/62) > c (1/61+1/63) > b (1/62) > d (1/63)
+    assert RT.HYBRID_RRF_K == 60 and RT.reciprocal_rank_fusion([[a], [a]])[0].puntuacion == pytest.approx(2 / 61)
+
+
+def test_reciprocal_rank_fusion_identifies_a_chunk_by_path_line_and_text_and_breaks_ties_by_list_then_rank():
+    x1, x2 = _hit("x.md", 3, "uno"), _hit("x.md", 3, "dos")  # misma ruta y línea (línea larga partida), distinto texto
+    assert len(RT.reciprocal_rank_fusion([[x1, x2], []])) == 2
+    p, q = _hit("p"), _hit("q")
+    tie = RT.reciprocal_rank_fusion([[p], [q]])  # 1/61 cada uno: gana el de la primera lista
+    assert [h.ruta for h in tie] == ["p", "q"] and tie[0].puntuacion == tie[1].puntuacion
+    assert [h.ruta for h in RT.reciprocal_rank_fusion([[q], [p]])] == ["q", "p"]
+    assert RT.reciprocal_rank_fusion([[], []]) == [] and RT.reciprocal_rank_fusion([]) == []
+
+
+def test_hybrid_retriever_fuses_the_complete_lists_of_bm25_and_the_embeddings():
+    fake = FakeEmbedder()
+    lexical = RT.LexicalRetriever(CHUNKS)
+    dense = RT.EmbeddingRetriever(RT.build_index(CHUNKS, fake, model="bge-m3"), fake)
+    hybrid = RT.HybridRetriever(lexical, dense)
+    assert isinstance(hybrid, RT.Retriever) and hybrid.name == "hybrid"
+    query = "backend de la GAN AMP_GAN_BACKEND"
+    got = hybrid.search(query, 3)
+    expected = RT.reciprocal_rank_fusion([lexical.search(query, 10**9), dense.search(query, 10**9)])
+    assert [(h.ruta, h.linea) for h in got] == [(h.ruta, h.linea) for h in expected[:3]] and got[0].ruta == "context/a.md"
+    assert got == sorted(got, key=lambda h: -h.puntuacion) and hybrid.search(query, 0) == [] and len(hybrid.search(query, 10)) == 3
+    # un fragmento que BM25 no puntúa (0) entra solo por los embeddings, con 1/(60 + rango)
+    only_dense = hybrid.search("xyzzy inexistente", 3)
+    assert len(only_dense) == 3 and all(h.puntuacion <= 1 / 61 + 1e-12 for h in only_dense)
+
+
+def test_hybrid_retriever_does_not_hide_a_failing_embedding_model():
+    class Down:
+        def embed(self, texts, timeout=None):
+            raise ProviderError("servidor caído")
+
+    dense = RT.EmbeddingRetriever(RT.build_index(CHUNKS, FakeEmbedder()), Down())
+    with pytest.raises(ProviderError, match="caído"):
+        RT.HybridRetriever(RT.LexicalRetriever(CHUNKS), dense).search("backend", 1)
+
+
+def test_retrieve_hybrid_backend_and_the_hybrid_role_config(tmp_path):
+    from amp_agents.run import retrieve
+
+    root = _search_project(tmp_path)
+    fake = FakeEmbedder()
+    hits = retrieve("backend AMP_GAN_BACKEND", root=root, k=2, backend="hybrid", embedder=fake, agent="retriever_hybrid")
+    assert hits[0]["ruta"].endswith("tech_stack.md") and len(hits) == 2 and (root / ".agent_runs" / "index" / "index.json").is_file()
+    cfg = A.get_agent_config("retriever_hybrid")
+    assert (cfg.mode, cfg.search_backend, cfg.model, cfg.provider, cfg.verifier) == ("embedding", "hybrid", "nomic-embed-text", "ollama", "retriever")
+    assert retrieve("backend AMP_GAN_BACKEND", root=root, k=1, embedder=fake, agent="retriever_hybrid")[0]["puntuacion"] < 0.04  # la configuración del rol manda: puntuación RRF
+    assert A.get_agent_config("retriever").search_backend == "lexical"  # el valor por defecto sigue siendo BM25
+    with pytest.raises(A.ConfigError, match="desconocido"):
+        retrieve("x", root=root, backend="magia")
+
+
+def test_search_docs_hybrid_backend_uses_both_and_refuses_an_index_of_another_model(tmp_path):
+    root = _search_project(tmp_path)
+    fake = FakeEmbedder()
+    cfg = _tool_config("hybrid")
+    with pytest.raises(ValueError, match="embedder"):
+        RT.search_docs_tool("hybrid")
+    (tool,) = A.make_tools(cfg, embedder=fake)
+    policy = A.make_policy(cfg, root)
+    assert "no existe el índice" in tool.run(policy, {"query": "backend"}).content
+    RT.save_index(RT.build_index(RT.chunk_project(root), fake), RT.resolve_index_dir(root))
+    (tool,) = A.make_tools(cfg, embedder=fake)
+    out = tool.run(policy, {"query": "backend AMP_GAN_BACKEND", "k": 1})
+    assert out.ok and out.content.startswith("context/constitution/tech_stack.md:1")
+
+    class Bge(FakeEmbedder):
+        model = "bge-m3"
+
+    RT.save_index(RT.build_index(RT.chunk_project(root), fake, model="nomic-embed-text"), RT.resolve_index_dir(root))
+    (tool,) = A.make_tools(cfg, embedder=Bge())
+    refused = tool.run(policy, {"query": "backend"})
+    assert not refused.ok and "reconstruirlo" in refused.content
+
+
+# -- evaluación del recuperador (embeddings e híbrido) ------------------------------------------------------------------------
+def _patch_retriever_live(monkeypatch, installed=("nomic-embed-text:latest", "bge-m3:latest")):
+    from amp_agents import eval_roles as E
+    from amp_agents import run as R
+
+    made = []
+
+    def make(config):
+        made.append(config.model)
+        return FakeEmbedder()
+
+    monkeypatch.setattr(R, "make_provider", make)
+    monkeypatch.setattr(E, "make_provider", make)
+    monkeypatch.setattr(E, "server_models", lambda base_url: list(installed))
+    monkeypatch.setattr(E, "ollama_ps", lambda *a, **k: {"processor": "100% GPU", "context_length": 2048})
+    monkeypatch.setattr(E, "ollama_stop", lambda model: "ok")
+    monkeypatch.setattr(E, "ollama_ps_text", lambda: "")
+    return E, made
+
+
+def _retriever_args(tmp_path, **kw):
+    from amp_agents import eval_roles as E
+
+    base = dict(workdir=str(tmp_path / "w"), results_dir=str(tmp_path / "r"), env_variant=1, tag="p3", reps=None, limit=None, drop=None, model=None, num_ctx=None, max_minutes=None)
+    base.update(kw)
+    return E.argparse.Namespace(**base)
+
+
+def test_hybrid_role_is_a_variant_of_the_retriever_with_the_same_criterion_and_is_not_in_all():
+    from amp_agents import eval_roles as E
+
+    assert E.base_role("retriever_hybrid") == "retriever" and "retriever_hybrid" in E.COMMAND_ROLES and "retriever_hybrid" in E.EVALUATORS
+    assert "retriever_hybrid" not in E.CRITERIA and "retriever_hybrid" not in E.ROLES and "retriever_hybrid" not in E.ALL_ROLES
+    assert E.CRITERIA["retriever"] == {"top3_min": 0.80}
+
+
+def test_evaluation_of_the_hybrid_reports_bm25_the_dense_alone_and_the_changes_per_query(tmp_path, monkeypatch):
+    E, made = _patch_retriever_live(monkeypatch)
+    out = E.evaluate_role("retriever_hybrid", _retriever_args(tmp_path, model="bge-m3", limit=3))
+    assert out["role"] == "retriever_hybrid@bge-m3" and out["model"] == "bge-m3" and out["protocol"] == E.CRITERIA["retriever"]
+    assert set(made) == {"bge-m3"} and (tmp_path / "r" / "retriever_hybrid@bge-m3_p3.json").is_file()
+    m = out["metrics"]
+    assert m["mode"] == "hybrid" and m["queries"] == 3 and m["dim"] == 64 and m["chunks"] > 100
+    assert {"main_top3", "embedding_top3", "lexical_top3", "gained_vs_bm25", "lost_vs_bm25", "query_s_mean", "embed_only_s_mean", "index_build_s", "longest_chunk_chars"} <= set(m)
+    first = out["runs"][0]["details"]
+    assert first["hybrid_rank"] == first["main_rank"] and "embedding_rank" in first and "lexical_rank" in first and first["hybrid_top"] and first["embed_only_s"] >= 0
+    assert "híbrido BM25 + embeddings (bge-m3)" in out["criteria"][0][0] and out["criteria"][0][1] == ">= 80 %"
+    text = "\n".join(out["notes"])
+    assert "Frente a BM25: fallo -> acierto" in text and "Tiempo: indexado" in text and "solo embeddings" in text and "100% GPU" in text
+    index = RT.load_index(tmp_path / "w" / "retriever_hybrid_copy" / ".agent_runs" / "index")
+    assert index["model"] == "bge-m3" and index["query_prefix"] == ""
+
+
+def test_evaluation_of_dense_bge_keeps_the_previous_output_shape(tmp_path, monkeypatch):
+    E, made = _patch_retriever_live(monkeypatch)
+    out = E.evaluate_role("retriever", _retriever_args(tmp_path, model="bge-m3", limit=2))
+    m = out["metrics"]
+    assert out["role"] == "retriever@bge-m3" and m["mode"] == "embedding" and m["embedding_top3"] == m["main_top3"] and out["runs"][0]["details"]["hybrid_rank"] is None
+    assert "Acierto en el top-3 con embeddings (bge-m3)" in out["criteria"][0][0] and "híbrido" not in "\n".join(c[0] for c in out["criteria"])
+    assert "solo embeddings" not in "\n".join(out["notes"]) and out["runs"][0]["details"]["embedding_rank"] == out["runs"][0]["details"]["main_rank"]
+
+
+def test_evaluation_of_the_retriever_respects_the_time_budget_while_indexing(tmp_path, monkeypatch):
+    from amp_agents.providers import ProviderTimeout
+
+    E, made = _patch_retriever_live(monkeypatch)
+    with pytest.raises(ProviderTimeout, match="presupuesto"):
+        E.evaluate_role("retriever", _retriever_args(tmp_path, model="bge-m3", max_minutes=1e-9))

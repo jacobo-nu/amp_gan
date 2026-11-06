@@ -20,3 +20,9 @@ Dos documentos del proyecto (rutas). El código se encarga de leerlos y de numer
 - El verificador de citas se aplica igual, pero como las citas las copia el código, «citas válidas» es trivial y no mide al modelo.
 - Cobertura del generador (documentos congelados de la evaluación): 5 de 6 semillas con sus dos líneas en un mismo par; es un techo para cualquier modelo.
 - El mensaje de sistema fijo vive en `pairs.py` (`PAIR_SYSTEM_PROMPT`).
+
+## Variantes probadas (ninguna cumple los tres criterios; verificador cerrado)
+- `doc_checker_pairs_short`: `tev1` con el estado corto `A: … / B: …` y umbral 0,5 (1,0 de 6 sembradas, 0 falsos positivos).
+- `doc_checker_pairs_json`: `gemma3:4b` con salida restringida `{"contradiccion": boolean}` (6 de 6 recuperadas por sesgo hacia «sí», 43 falsos positivos).
+- `doc_checker_pairs_agree`: `gemma3:4b` con dos preguntas (contradicción solo si «se contradicen» = sí y «pueden ser verdaderas a la vez» = no): 3,6 de 6 y 22 falsos positivos.
+En todas el mensaje de sistema vive en `pairs.py` y no se usa un `context/agents/<rol>.md` para el juicio.

@@ -505,3 +505,130 @@ def test_evaluation_of_a_decision_model_uses_the_threshold_and_reports_the_sensi
     assert any("umbral fijado de antemano (0,5)" in line for line in out["notes"])
     saved = out["runs"][0]["details"]["judgments"]
     assert saved[12]["score"] is not None and all(j["status"] == "ok" for j in saved)
+
+
+# -- tres variantes declaradas el 2026-11-06 (V1 estado corto, V2 salida restringida, V3 acuerdo de dos preguntas) -------------
+VARIANTS = ("doc_checker_pairs_short", "doc_checker_pairs_json", "doc_checker_pairs_agree")
+
+
+def test_variants_are_roles_with_the_same_criteria_and_their_declared_settings():
+    for role in VARIANTS:
+        assert E.base_role(role) == "doc_checker" and role in E.COMMAND_ROLES and role in E.EVALUATORS
+        assert role not in E.CRITERIA and role not in E.REPS and role not in E.ALL_ROLES
+        cfg = get_agent_config(role)
+        assert cfg.mode == "single_shot" and cfg.tools == [] and cfg.timeout == cfg.max_seconds == 60  # tope de tiempo explícito
+    short, js, agree = (get_agent_config(r) for r in VARIANTS)
+    assert (short.provider, short.model) == ("ollama_systemone", "tev1:4b-q4_K_M")
+    assert (js.provider, js.model, js.max_tokens, js.options["num_ctx"], js.options["temperature"]) == ("ollama", "gemma3:4b", 24, 2048, 0.2)
+    assert (agree.provider, agree.model, agree.max_tokens) == ("ollama", "gemma3:4b", 24)
+    assert js.options["format"] == agree.options["format"] == P.PAIR_FORMAT_SCHEMA  # el esquema de la config es el de la primera pregunta
+    assert P.PAIR_FORMAT_SCHEMA["properties"] == {"contradiccion": {"type": "boolean"}} and "motivo" not in P.PAIR_FORMAT_SCHEMA["properties"]
+    assert P.COMPAT_FORMAT_SCHEMA["properties"] == {"compatibles": {"type": "boolean"}}
+    assert [P.pair_mode(r) for r in ("doc_checker_pairs", *VARIANTS)] == ["chat", "short", "chat", "agree"]
+    assert E.CRITERIA["doc_checker"] == {"valid_citations_min": 0.90, "recovered_mean_min": 4.0, "false_positives_max": 2}
+
+
+def test_short_state_has_no_paths_and_is_only_two_prefixed_lines():
+    assert P.pair_state_short(PAIR) == "A: Hecho: 49 tests\nB: Hecho: 46 tests"
+    decider = FakeDecider([0.87, 0.2])
+    judged = P.judge_pairs(decider, [PAIR] * 2, 5.0, mode="short")
+    assert [j.verdict for j in judged] == [True, False]
+    assert decider.calls[0][0] == "A: Hecho: 49 tests\nB: Hecho: 46 tests" and decider.calls[0][1] == {"contradiccion": P.DECISION_QUESTION}
+    assert P.DECISION_THRESHOLD == 0.5
+    decider = FakeDecider([0.6])
+    P.judge_pairs(decider, [PAIR], 5.0)  # sin mode: el estado de siempre, con rutas
+    assert "Línea A (`" in decider.calls[0][0]
+
+
+def test_parse_verdict_reads_the_second_question_key_only():
+    assert P.parse_verdict('{"compatibles": false}', "compatibles") == (False, "", "ok")
+    assert P.parse_verdict('{"contradiccion": true}', "compatibles") == (None, "", "formato")
+    assert P.parse_verdict('{"compatibles": true}') == (None, "", "formato")
+
+
+def test_native_provider_sends_the_output_schema_as_format_at_the_top_level(fake_server):
+    from amp_agents.providers import OllamaProvider
+
+    options = {"num_ctx": 2048, "num_predict": 24, "format": P.PAIR_FORMAT_SCHEMA}
+    fake_server.responses.append((200, {"message": {"role": "assistant", "content": '{"contradiccion":true}'}, "done_reason": "stop"}))
+    reply = OllamaProvider(fake_server.base_url, "gemma3:4b", options=options).chat([{"role": "user", "content": "x"}])
+    body = fake_server.requests[0]["body"]
+    assert body["format"] == P.PAIR_FORMAT_SCHEMA and body["options"] == {"num_ctx": 2048, "num_predict": 24} and P.parse_verdict(reply.content)[0] is True
+    assert options["format"] == P.PAIR_FORMAT_SCHEMA  # no modifica las opciones del proveedor
+
+
+@pytest.mark.parametrize("p1,p2,expected", [(True, False, True), (True, True, False), (False, False, False), (False, True, False)])
+def test_agree_declares_a_contradiction_only_when_p1_yes_and_p2_no(p1, p2, expected):
+    first = ScriptedProvider([json.dumps({"contradiccion": p1})])
+    second = ScriptedProvider([json.dumps({"compatibles": p2})])
+    j = P.judge_pair_agree(first, second, PAIR, 4, 9.0, log_dir=False)
+    assert (j.verdict, j.status, j.p1, j.p2, j.positive) == (expected, "ok", p1, p2, expected)
+    assert first.timeouts == second.timeouts == [9.0]  # tope de tiempo en las dos peticiones
+    assert first.received[0][0]["content"] == P.PAIR_SYSTEM_PROMPT and second.received[0][0]["content"] == P.COMPAT_SYSTEM_PROMPT
+    assert "¿Se contradicen?" in first.received[0][1]["content"] and "¿Pueden ser verdaderas las dos a la vez?" in second.received[0][1]["content"]
+    assert f"Línea A (`{E.ROADMAP_REL}`)" in second.received[0][1]["content"] and '"compatibles"' in P.COMPAT_SYSTEM_PROMPT
+
+
+def test_agree_counts_an_unreadable_answer_as_no_contradiction_and_sums_cost():
+    ok_yes = AssistantMessage(content='{"contradiccion": true}', usage=Usage(10, 8))
+    for first, second, status in [
+        (ok_yes, "¿?", "formato"),
+        (ok_yes, ProviderTimeout("lento"), "timeout"),
+        (ProviderError("roto"), '{"compatibles": false}', "error"),
+        (ok_yes, "", "vacia"),
+    ]:
+        j = P.judge_pair_agree(ScriptedProvider([first]), ScriptedProvider([second]), PAIR, 0, 5.0, log_dir=False)
+        assert j.verdict is None and j.status == status and not j.positive
+    j = P.judge_pair_agree(ScriptedProvider([ok_yes]), ScriptedProvider([AssistantMessage(content='{"compatibles": false}', usage=Usage(20, 6))]), PAIR, 0, 5.0, log_dir=False)
+    assert (j.prompt_tokens, j.completion_tokens, j.positive) == (30, 14, True)
+
+
+def test_judge_pairs_agree_mode_uses_the_second_provider_for_p2():
+    first = ScriptedProvider(['{"contradiccion": true}', '{"contradiccion": true}'])
+    second = ScriptedProvider(['{"compatibles": false}', '{"compatibles": true}'])
+    judged = P.judge_pairs(first, [PAIR, PAIR], 5.0, log_dir=False, mode="agree", provider2=second)
+    assert [j.positive for j in judged] == [True, False] and len(first.received) == len(second.received) == 2
+
+
+def run_variant_evaluation(tmp_path, monkeypatch, role, scripted, model, **kw):
+    patch_live(monkeypatch, scripted, installed=(model,))
+    return E.evaluate_role(role, eval_args(tmp_path, model=model, **kw))
+
+
+def test_evaluation_of_the_restricted_output_variant_has_its_own_name_and_the_same_criteria(tmp_path, monkeypatch):
+    scripted = ScriptedProvider(["{}", *scripted_for_one_rep()])
+    out = run_variant_evaluation(tmp_path, monkeypatch, "doc_checker_pairs_json", scripted, "gemma3:4b", tag="p2")
+    assert out["role"] == "doc_checker_pairs_json@gemma3-4b" and out["protocol"] == E.CRITERIA["doc_checker"]
+    assert (tmp_path / "r" / "doc_checker_pairs_json@gemma3-4b_p2.json").is_file() and (tmp_path / "r" / "pairs_doc_checker_pairs_json@gemma3-4b.json").is_file()
+    assert out["metrics"]["recovered_per_rep"] == [1] and out["metrics"]["requests"] == 120 and len(scripted.received) == 121
+    assert out["num_ctx"] == 2048 and out["runs"][0]["num_ctx_config"] == 2048
+
+
+def test_evaluation_of_the_agreement_variant_asks_two_questions_per_pair(tmp_path, monkeypatch):
+    road, todo = E.frozen_docs()
+    s_road, s_todo, seeds = E.seed_documents(road, todo)
+    seeded = P.build_pairs(*docs(s_road, s_todo))
+    cifra = next(s for s in seeds if s["id"] == "cifra")
+    target = {(cifra["file"], cifra["line"]), (cifra["partner_file"], cifra["partner_line"])}
+    answers = ["{}"]  # calentamiento
+    for pair in seeded.pairs:
+        yes = set(pair.ends) == target
+        answers += [json.dumps({"contradiccion": True}), json.dumps({"compatibles": not yes})]  # P1 siempre sí: solo P2 decide
+    for _ in range(60):
+        answers += [json.dumps({"contradiccion": True}), json.dumps({"compatibles": True})]  # copia limpia: P2 frena todo
+    scripted = ScriptedProvider(answers)
+    out = run_variant_evaluation(tmp_path, monkeypatch, "doc_checker_pairs_agree", scripted, "gemma3:4b", tag="p2")
+    m = out["metrics"]
+    assert out["role"] == "doc_checker_pairs_agree@gemma3-4b" and len(scripted.received) == 1 + 240
+    assert m["recovered_per_rep"] == [1] and m["false_positives_clean_per_rep"] == [0] and m["positives"] == 1 and m["format_failures"] == 0
+    j = out["runs"][0]["details"]["judgments"]
+    assert sum(x["p1"] is True for x in j) == 60 and sum(x["p2"] is False for x in j) == 1
+    assert scripted.received[1][0]["content"] == P.PAIR_SYSTEM_PROMPT and scripted.received[2][0]["content"] == P.COMPAT_SYSTEM_PROMPT
+
+
+def test_evaluation_of_the_short_state_variant_reports_threshold_sensitivity(tmp_path, monkeypatch):
+    decider = FakeDecider([0.5] + [0.1] * 120)
+    out = run_variant_evaluation(tmp_path, monkeypatch, "doc_checker_pairs_short", decider, "tev1:4b-q4_K_M", tag="p2")
+    assert out["role"] == "doc_checker_pairs_short@tev1-4b-q4_K_M" and len(decider.calls) == 121
+    assert decider.calls[1][0].startswith("A: ") and "Línea A" not in decider.calls[1][0]
+    assert out["metrics"]["positives"] == 0 and [r["threshold"] for r in out["metrics"]["threshold_sensitivity"]] == list(P.SENSITIVITY_THRESHOLDS)

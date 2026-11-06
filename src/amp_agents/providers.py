@@ -297,8 +297,8 @@ class OllamaProvider(ChatProvider):
     """Cliente de la API nativa de Ollama (``POST {base_url}/api/chat``).
 
     Misma interfaz que :class:`OpenAICompatProvider`. Las ``options`` van a ``options`` de Ollama
-    (``num_ctx``, ``temperature``, ``seed``...); las claves ``think`` y ``keep_alive`` se envían en el
-    primer nivel de la petición. ``base_url`` es la raíz del servidor (sin ``/v1``).
+    (``num_ctx``, ``temperature``, ``seed``...); las claves ``think``, ``keep_alive`` y ``format`` (esquema JSON que
+    restringe la salida) se envían en el primer nivel de la petición. ``base_url`` es la raíz del servidor (sin ``/v1``).
     """
 
     name = "ollama"
@@ -330,7 +330,7 @@ class OllamaProvider(ChatProvider):
     def chat(self, messages: Sequence[dict], tools: Sequence[dict] | None = None, timeout: float | None = None) -> AssistantMessage:
         options = dict(self.options)
         body: dict[str, Any] = {"model": self.model, "messages": self._convert(messages), "stream": False}
-        for key in ("think", "keep_alive"):
+        for key in ("think", "keep_alive", "format"):
             if key in options:
                 body[key] = options.pop(key)
         if options:
@@ -372,6 +372,7 @@ class OllamaProvider(ChatProvider):
             if key in options:
                 body[key] = options.pop(key)
         options.pop("think", None)
+        options.pop("format", None)
         options.pop("num_predict", None)
         if options:
             body["options"] = options

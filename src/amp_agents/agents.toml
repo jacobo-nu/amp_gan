@@ -41,7 +41,8 @@ temperature = 0.2
 # search_docs (herramienta de solo lectura) se puede añadir a `tools` de cualquier rol de modo agent; por defecto
 # ningún rol la tiene. search_backend = "lexical" (BM25 sin modelo ni índice; es el valor POR DEFECTO, también para el
 # rol retriever y para search_docs) o "embedding" (opción explícita: usa el índice y el modelo del rol retriever; en la
-# evaluación en vivo puntuó por debajo de BM25, 60 % frente a 73 % en el top-3).
+# evaluación en vivo puntuó por debajo de BM25, 60 % frente a 73 % en el top-3) o "hybrid" (BM25 + embeddings por rango recíproco;
+# ver el rol retriever_hybrid).
 
 # RETIRADO: el localizador con modelo (llama3.2:3b) acertó el 10 % en la evaluación en vivo y lo que hace es `grep`.
 # La función determinista amp_agents.locate.locate() lo sustituye. Esta sección y su evaluación (eval_roles locator, o
@@ -130,6 +131,66 @@ definition_fallback = "doc_checker_ss"
 num_ctx = 2048
 temperature = 0.2
 
+# Variantes de doc_checker_pairs declaradas el 2026-11-06 (ver el punto 8 del docstring de amp_agents.pairs; mismos criterios):
+# - doc_checker_pairs_short: modelo de decisión tev1 con el estado corto «A: ...\nB: ...» (solo cambia el formato del estado).
+# - doc_checker_pairs_json: gemma3:4b con salida restringida (`format` de Ollama, esquema {"contradiccion": boolean}), max_tokens 24.
+# - doc_checker_pairs_agree: gemma3:4b con dos preguntas (P1 «¿se contradicen?», P2 «¿pueden ser verdaderas las dos a la vez?»);
+#   contradicción solo si P1 = sí y P2 = no. El esquema de `format` de la configuración es el de P1; el de P2 lo pone el código.
+[agents.doc_checker_pairs_short]
+mode = "single_shot"
+provider = "ollama_systemone"
+model = "tev1:4b-q4_K_M"
+base_url = "http://localhost:11434"
+timeout = 60
+max_seconds = 60
+max_tokens = 96
+tools = []
+read = ["context", "src"]
+write = []
+verifier = "doc_checker"
+definition_fallback = "doc_checker_ss"
+
+[agents.doc_checker_pairs_short.options]
+num_ctx = 8192
+
+[agents.doc_checker_pairs_json]
+mode = "single_shot"
+provider = "ollama"
+model = "gemma3:4b"
+base_url = "http://localhost:11434"
+timeout = 60
+max_seconds = 60
+max_tokens = 24
+tools = []
+read = ["context", "src"]
+write = []
+verifier = "doc_checker"
+definition_fallback = "doc_checker_ss"
+
+[agents.doc_checker_pairs_json.options]
+num_ctx = 2048
+temperature = 0.2
+format = { type = "object", properties = { contradiccion = { type = "boolean" } }, required = ["contradiccion"] }
+
+[agents.doc_checker_pairs_agree]
+mode = "single_shot"
+provider = "ollama"
+model = "gemma3:4b"
+base_url = "http://localhost:11434"
+timeout = 60
+max_seconds = 60
+max_tokens = 24
+tools = []
+read = ["context", "src"]
+write = []
+verifier = "doc_checker"
+definition_fallback = "doc_checker_ss"
+
+[agents.doc_checker_pairs_agree.options]
+num_ctx = 2048
+temperature = 0.2
+format = { type = "object", properties = { contradiccion = { type = "boolean" } }, required = ["contradiccion"] }
+
 [agents.code_reviewer]
 mode = "agent"
 provider = "ollama"
@@ -147,6 +208,32 @@ verifier = "code_reviewer"
 [agents.code_reviewer.options]
 num_ctx = 8192
 temperature = 0.2
+
+# Revisor ACOTADO por función y por tipo de defecto (amp_agents.func_review, diseño fijado el 2026-11-06): el código divide el
+# fichero con `ast` y hace UNA petición sin herramientas por función y categoría (5), con salida restringida (`format`; esquema
+# REVIEW_FORMAT_SCHEMA de amp_agents.func_review, {"defecto": boolean, "linea": integer}); la cita la copia el código de la
+# línea indicada. El mensaje de sistema es fijo y vive en amp_agents.func_review (REVIEW_SYSTEM_PROMPT); `definition_fallback` solo
+# sirve si algún día se ensambla el prompt con build_system_prompt. Mismos criterios que code_reviewer. Variantes de modelo con
+# `eval_roles code_reviewer_funcs --model ...` (qwen2.5-coder:7b por defecto; gemma3:4b; phi4-mini). num_ctx pequeño: una función de
+# hasta 40 líneas con su numeración y el mensaje de sistema caben de sobra en 2048 (se mide en la evaluación: prompt máximo).
+[agents.code_reviewer_funcs]
+mode = "single_shot"
+provider = "ollama"
+model = "qwen2.5-coder:7b"
+base_url = "http://localhost:11434"
+timeout = 60
+max_seconds = 60
+max_tokens = 32
+tools = []
+read = ["src", "context"]
+write = []
+verifier = "code_reviewer"
+definition_fallback = "code_reviewer"
+
+[agents.code_reviewer_funcs.options]
+num_ctx = 2048
+temperature = 0.2
+format = { type = "object", properties = { defecto = { type = "boolean" }, linea = { type = "integer" } }, required = ["defecto", "linea"] }
 
 [agents.summarizer]
 mode = "single_shot"
@@ -181,6 +268,29 @@ search_backend = "lexical"      # BM25 por defecto; "embedding" (nomic-embed-tex
 verifier = "retriever"
 
 [agents.retriever.options]
+num_ctx = 2048
+
+# Recuperador HÍBRIDO (amp_agents.retrieval, diseño fijado el 2026-11-06): BM25 + embeddings fusionados por rango recíproco (RRF, k = 60,
+# pesos iguales, listas completas). Mismo troceado, mismo índice (que guarda el modelo y no se reutiliza entre modelos) y mismo
+# criterio que `retriever`. El modelo por defecto es nomic-embed-text; `eval_roles retriever_hybrid --model bge-m3` prueba el otro.
+# `bge-m3` no usa prefijos de tarea (los de nomic dependen del modelo: retrieval.prefixes_for).
+[agents.retriever_hybrid]
+mode = "embedding"
+provider = "ollama"
+model = "nomic-embed-text"
+base_url = "http://localhost:11434"
+timeout = 120
+max_seconds = 600
+max_tokens = 0
+tools = []
+read = ["context", "src"]
+write = []
+index_dir = ".agent_runs/index"
+search_backend = "hybrid"
+verifier = "retriever"
+definition_fallback = "retriever"
+
+[agents.retriever_hybrid.options]
 num_ctx = 2048
 
 # --- Ejemplos (descomenta y ajusta) -------------------------------------------------------------

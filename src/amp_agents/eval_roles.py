@@ -7,8 +7,11 @@ Uso (desde la carpeta ``src``, con Ollama en marcha y los modelos descargados)::
     python -m amp_agents.eval_roles doc_checker_ss --workdir ...   # variante de una pasada de doc_checker (mismo protocolo y criterios)
     python -m amp_agents.eval_roles doc_checker_pairs --model gemma3:4b --reps 5 --workdir ...   # verificador acotado: el código da pares de líneas, el modelo juzga sí/no
     python -m amp_agents.eval_roles code_reviewer --workdir ...
+    python -m amp_agents.eval_roles code_reviewer_funcs --model qwen2.5-coder:7b --reps 5 --max-minutes 38 --workdir ...   # revisor acotado: una pregunta por función y tipo de defecto
     python -m amp_agents.eval_roles summarizer    --workdir ...
     python -m amp_agents.eval_roles retriever     --workdir ...
+    python -m amp_agents.eval_roles retriever --model bge-m3 --workdir ...            # embeddings de otro modelo (sin prefijos: ver amp_agents.retrieval)
+    python -m amp_agents.eval_roles retriever_hybrid --model bge-m3 --workdir ...     # BM25 + embeddings por rango recíproco (RRF, k = 60)
     python -m amp_agents.eval_roles all           --workdir ... --deadline-min 90   # sin el localizador; añádelo con --roles locator,...
     python -m amp_agents.eval_roles report        --results-dir ...
     python -m amp_agents.eval_roles doc_checker_ss --model gemma3:4b --num-ctx 12288 --reps 5 --tag g3 --workdir ...   # otro modelo, sin tocar agents.toml
@@ -58,6 +61,13 @@ PROTOCOLO Y CRITERIOS (fijados de antemano; no se ajustan tras ver los resultado
   en castellano (proporción de palabras funcionales castellanas >= 0,8, ver ``verifiers``) en TODAS las ejecuciones.
 - retriever (``nomic-embed-text``): 15 consultas en castellano con verdad escrita a mano (fichero y palabra clave en
   el fragmento). Criterio: acierto en el top-3 >= 80 %. Se mide igual la línea base léxica (BM25).
+- retriever_hybrid (``nomic-embed-text`` por defecto, o ``--model``): el mismo protocolo y el mismo criterio (entrada ``retriever`` de
+  ``CRITERIA``) con la fusión BM25 + embeddings por rango recíproco (diseño fijado en el docstring de ``amp_agents.retrieval``);
+  se informan además BM25, los embeddings solos y las consultas que cambian de acierto a fallo y viceversa respecto de BM25.
+- code_reviewer_funcs (``qwen2.5-coder:7b`` por defecto, modo ``single_shot``): el mismo fichero, las mismas semillas, la misma copia
+  sembrada y limpia y LOS MISMOS criterios (entrada ``code_reviewer`` de ``CRITERIA``), pero el código divide el fichero en funciones
+  y hace UNA pregunta por función y tipo de defecto con salida restringida; las citas las pone el código (literales por
+  construcción: el criterio de citas válidas no mide al modelo). Diseño fijado en el docstring de ``amp_agents.func_review``.
 
 Segunda iteración (los criterios de arriba NO cambian): el localizador con modelo queda retirado (10 % de aciertos; lo
 sustituye ``amp_agents.locate``) y ``all`` no lo incluye por defecto. Para el revisor y el resumidor, los criterios se
@@ -88,10 +98,11 @@ from pathlib import Path
 
 from .agents import PROJECT_ROOT, ConfigError, get_agent_config, make_provider
 from .locate import find_definitions, find_lines  # noqa: F401 (la verdad del localizador; se reexportan)
+from .func_review import CATEGORIES, CATEGORY_BY_KEY, build_findings as build_func_findings, match_by_category, request_stats, review_units, seed_flags, split_functions, yes_rates
 from .loop import AgentResult
-from .pairs import SENSITIVITY_THRESHOLDS, build_findings, build_pairs, judge_pairs, judgment_stats, pairs_to_json, seed_coverage
-from .providers import ProviderError, Usage
-from .retrieval import LexicalRetriever, chunk_project
+from .pairs import COMPAT_FORMAT_SCHEMA, SENSITIVITY_THRESHOLDS, build_findings, build_pairs, judge_pairs, judgment_stats, pair_mode, pairs_to_json, seed_coverage
+from .providers import ProviderError, ProviderTimeout, Usage
+from .retrieval import LexicalRetriever, build_index, chunk_project, prefixes_for, resolve_index_dir, save_index
 from .run import prepare_task, retrieve, run_task
 from .smoke_live import make_copy as _smoke_copy
 from .smoke_live import server_models, snapshot
@@ -116,7 +127,15 @@ RETIRED_ROLES = ("locator",)
 ALL_ROLES = ("locator", *ROLES)
 # Variantes de un rol: se evalúan con el protocolo y los criterios de su rol base, pero con su propio nombre en los
 # ficheros de resultados. No entran en ``all`` (se piden expresamente, para comparar con el rol base).
-VARIANT_ROLES = {"doc_checker_ss": "doc_checker", "doc_checker_pairs": "doc_checker"}
+VARIANT_ROLES = {
+    "doc_checker_ss": "doc_checker",
+    "doc_checker_pairs": "doc_checker",
+    "doc_checker_pairs_short": "doc_checker",
+    "doc_checker_pairs_json": "doc_checker",
+    "doc_checker_pairs_agree": "doc_checker",
+    "code_reviewer_funcs": "code_reviewer",
+    "retriever_hybrid": "retriever",
+}
 COMMAND_ROLES = (*ALL_ROLES, *VARIANT_ROLES)
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 DEFAULT_WORKDIR = Path(tempfile.gettempdir()) / "amp_roles_eval"
@@ -767,6 +786,10 @@ def eval_doc_checker_pairs(args, rec: Recorder, work: Path, results: Path, role:
     (results / f"seeds_{trial.label}.json").write_text(json.dumps(seeds, ensure_ascii=False, indent=1), encoding="utf-8")
     config = get_agent_config(role, **trial.overrides)
     provider = make_provider(config)
+    mode = pair_mode(role)
+    provider2 = None
+    if mode == "agree":  # la segunda pregunta tiene su propio esquema de salida (``compatibles``)
+        provider2 = make_provider(get_agent_config(role, **{**trial.overrides, "options": {**config.options, "format": COMPAT_FORMAT_SCHEMA}}))
     reps = args.reps or REPS[base_role(role)]
     criteria = CRITERIA[base_role(role)]
     pair_sets = {name: build_pairs((ROADMAP_REL, (root / ROADMAP_REL).read_text(encoding="utf-8")), (TODO_REL, (root / TODO_REL).read_text(encoding="utf-8"))) for name, root in copies.items()}
@@ -798,7 +821,7 @@ def eval_doc_checker_pairs(args, rec: Recorder, work: Path, results: Path, role:
             root, ps = copies[name], pair_sets[name]
             before = snapshot(root)
             t0 = time.monotonic()
-            judgments = judge_pairs(provider, ps.pairs, config.max_seconds, log_dir=results / "logs", label=f"{trial.label}_{name}_{rep}_v{args.env_variant}", root=root, deadline=deadline)
+            judgments = judge_pairs(provider, ps.pairs, config.max_seconds, log_dir=results / "logs", label=f"{trial.label}_{name}_{rep}_v{args.env_variant}", root=root, deadline=deadline, mode=mode, provider2=provider2)
             this_rep[name] = judgments
             stats = judgment_stats(judgments)
             omitted = stats["by_status"].get("omitida", 0)
@@ -1055,6 +1078,154 @@ def _code_summary(runs: list[RunRecord], per_rep: list[dict]) -> dict:
     }
 
 
+# -- code_reviewer_funcs: una pregunta por función y por tipo de defecto ---------------------------------------------------
+def eval_code_reviewer_funcs(args, rec: Recorder, work: Path, results: Path, role: str = "code_reviewer_funcs") -> dict:
+    """Evalúa el revisor acotado (``amp_agents.func_review``) con el protocolo y los criterios de ``code_reviewer``.
+
+    Mismo fichero, mismas semillas y misma copia sembrada y limpia que ``eval_code_reviewer``. Por repetición y copia: el código divide
+    el fichero en funciones, hace UNA petición por función y categoría de defecto, y construye los hallazgos con la cita copiada de la
+    línea (literal por construcción). ``--max-minutes`` es un presupuesto de tiempo (como en ``doc_checker_pairs``).
+    """
+    trial = trial_for(role, args)
+    source = (PROJECT_ROOT / CODE_REL).read_text(encoding="utf-8")
+    seeded_text, seeds = seed_code_defects(source)
+    (results / f"seeds_{trial.label}.json").write_text(json.dumps(seeds, ensure_ascii=False, indent=1), encoding="utf-8")
+    names = ("seeded", "clean")
+    copies = {}
+    for name, text in {"seeded": seeded_text, "clean": source}.items():
+        root = make_copy(work / f"{role}_{name}")
+        (root / CODE_REL).write_text(text, encoding="utf-8")
+        copies[name] = (root, text, split_functions(text))
+    config = get_agent_config(role, **trial.overrides)
+    provider = make_provider(config)
+    reps = args.reps or REPS[base_role(role)]
+    criteria = CRITERIA[base_role(role)]
+    requests_per_rep = len(CATEGORIES) * sum(len(units) for _, _, units in copies.values())
+    layout = {name: [(u.title, u.start, u.end) for u in units] for name, (_, _, units) in copies.items()}
+    (results / f"units_{trial.label}.json").write_text(json.dumps(layout, ensure_ascii=False, indent=1), encoding="utf-8")
+    for name, (_, _, units) in copies.items():
+        print(f"    unidades ({name}): {len(units)} funciones o trozos x {len(CATEGORIES)} categorías = {len(units) * len(CATEGORIES)} peticiones por repetición y copia", file=sys.stderr, flush=True)
+    minutes = getattr(args, "max_minutes", None)
+    budget = minutes * 60 if minutes else None
+    started = time.monotonic()
+    deadline = None if budget is None else started + budget
+    per_rep: list[dict] = []
+    all_stats: list[dict] = []
+    rows: list[dict] = []  # una fila por petición de las repeticiones completas (para el sesgo hacia «sí»)
+    strict_by_rep: list[list[str]] = []
+    any_by_rep: list[list[str]] = []
+    last_rep_s = 0.0
+    truncated_reps = 0
+    for rep in range(1, reps + 1):
+        if rep > 1 and not rep_fits_budget(time.monotonic() - started, last_rep_s, budget):
+            print(f"    presupuesto de {minutes:g} min: no se empieza la repetición {rep} (la anterior tardó {last_rep_s / 60:.1f} min)", file=sys.stderr, flush=True)
+            break
+        rep_started = time.monotonic()
+        entry = {"rep": rep}
+        rep_truncated = False
+        rep_rows: list[dict] = []
+        for name in names:
+            root, text, units = copies[name]
+            before = snapshot(root)
+            t0 = time.monotonic()
+            verdicts = review_units(provider, CODE_REL, text, units, config.max_seconds, log_dir=results / "logs", label=f"{trial.label}_{name}_{rep}_v{args.env_variant}", root=root, deadline=deadline)
+            stats = request_stats(verdicts)
+            omitted = stats["by_status"].get("omitida", 0)
+            obj = build_func_findings(verdicts, units)
+            report = json.dumps(obj, ensure_ascii=False)
+            verification = verify("code_reviewer", report, root=root, source=text)
+            valid_output = bool(verification.details.get("schema_ok")) and not omitted
+            seeds_here = seeds if name == "seeded" else []
+            match = match_code_findings(obj, seeds_here) if valid_output else {"recovered": [], "false_positives": [], "n_findings": 0}
+            by_category = match_by_category(obj["hallazgos"], seeds_here) if valid_output else {"any": [], "strict": []}
+            citations = verification.details.get("citations", [])
+            correction = verification.details.get("line_correction") if valid_output else None
+            match_fixed = match_code_findings(verifiable_findings(correction["obj"]), seeds_here) if correction else {"recovered": [], "false_positives": [], "n_findings": 0}
+            flags = seed_flags(verdicts, units, seeds_here)
+            for v, flag in zip(verdicts, flags):
+                if v.status != "omitida":
+                    rep_rows.append({"copy": name, "unit_name": units[v.unit].title, "category": v.category, "said_yes": v.said_yes, **flag})
+            found_categories = sorted({f["categoria"] for f in obj["hallazgos"]})
+            if name == "seeded":
+                ok = valid_output and len(match["recovered"]) >= 1
+                notes = f"hallazgos={match['n_findings']} recuperados={len(match['recovered'])}/5 {match['recovered']} con su categoría={len(by_category['strict'])} {by_category['strict']} sin_defecto_cerca={len(match['false_positives'])}"
+            else:
+                ok = valid_output and match["n_findings"] <= criteria["false_positives_max"]
+                notes = f"hallazgos_en_copia_limpia={match['n_findings']} categorías={found_categories}"
+            notes += f" | peticiones={stats['asked']} sí={stats['yes']} formato={stats['format_failures']} fuera_de_rango={stats['out_of_range']} fallos_peticion={stats['request_failures']} s/petición={stats['seconds_mean']}"
+            if omitted:
+                notes += f" TRUNCADA por presupuesto de tiempo ({omitted} peticiones sin hacer)"
+                rep_truncated = True
+            usage = Usage(sum(v.prompt_tokens for v in verdicts), sum(v.completion_tokens for v in verdicts))
+            stop = "budget" if omitted else ("partial" if stats["request_failures"] else "final")
+            result = AgentResult(
+                report=report, steps=stats["asked"], stop_reason=stop, duration_s=time.monotonic() - t0, tokens=usage,
+                last_prompt_tokens=max((v.prompt_tokens for v in verdicts), default=None) or None,
+                error="; ".join(sorted({f"{v.status}: {v.motivo}" for v in verdicts if v.status in {"timeout", "error"}}))[:300] or None,
+            )
+            details = {
+                "copy": name, "match": match, "citations": citations, "valid_output": valid_output, "seeds": seeds_here, "by_category": by_category,
+                "match_corrected": match_fixed, "line_correction": None if not correction else {k: v for k, v in correction.items() if k != "obj"},
+                "findings": obj["hallazgos"], "verdicts": [{**asdict(v), **flag} for v, flag in zip(verdicts, flags)], "request_stats": stats, "truncated": bool(omitted),
+            }
+            rec.add(_system_record(role, name, rep, result, root, before, args.env_variant, ok, notes, details, verification, trial))
+            all_stats.append(stats)
+            entry[name] = {
+                "recovered": len(match["recovered"]), "findings": match["n_findings"], "valid_output": valid_output, "recovered_corrected": len(match_fixed["recovered"]),
+                "findings_verifiable": correction["verifiable"] if correction else 0, "recovered_strict": len(by_category["strict"]),
+            }
+            if name == "seeded":
+                strict_by_rep.append(by_category["strict"])
+                any_by_rep.append(by_category["any"])
+            else:
+                entry[name]["by_category"] = {k: sum(1 for f in obj["hallazgos"] if f["categoria"] == k) for k in CATEGORY_BY_KEY}
+        last_rep_s = time.monotonic() - rep_started
+        if rep_truncated:
+            truncated_reps += 1
+            strict_by_rep, any_by_rep = strict_by_rep[: len(per_rep)], any_by_rep[: len(per_rep)]
+            break
+        per_rep.append(entry)
+        rows.extend(rep_rows)
+    summary = _code_summary(rec.runs, per_rep)
+    asked = sum(st["asked"] for st in all_stats)
+    reps_done = len(per_rep)
+    incomplete = reps_done < reps
+    seconds = sum(st["seconds_total"] for st in all_stats)
+    per_seed = {s["id"]: {"any": sum(s["id"] in found for found in any_by_rep), "strict": sum(s["id"] in found for found in strict_by_rep)} for s in seeds}
+    clean_by_category = {k: sum(e["clean"].get("by_category", {}).get(k, 0) for e in per_rep) for k in CATEGORY_BY_KEY}
+    rates = yes_rates(rows)
+    processors = sorted({r.processor for r in rec.runs if r.processor})
+    summary["metrics"].update(
+        {
+            "reps_done": reps_done, "reps_planned": reps, "incomplete": incomplete, "truncated_reps": truncated_reps, "requests": asked, "requests_per_rep": requests_per_rep,
+            "units": {name: len(units) for name, (_, _, units) in copies.items()}, "seeds_recovered_by_rep": per_seed, "recovered_strict_per_rep": [e["seeded"]["recovered_strict"] for e in per_rep if "seeded" in e],
+            "clean_findings_by_category": clean_by_category, "yes_rates": rates, "format_failures": sum(st["format_failures"] for st in all_stats), "out_of_range": sum(st["out_of_range"] for st in all_stats),
+            "blank_line": sum(st["blank_line"] for st in all_stats), "request_failures": sum(st["request_failures"] for st in all_stats), "yes_total": sum(st["yes"] for st in all_stats),
+            "seconds_per_request_mean": round(seconds / asked, 2) if asked else 0.0, "model_seconds_total": round(seconds, 1), "prompt_tokens_max": max((st["prompt_tokens_max"] for st in all_stats), default=0),
+            "processors": processors
+        }
+    )
+
+    def pct(item: dict) -> str:
+        return f"{item['pct']:g} % ({item['yes']}/{item['n']})" if item["n"] else "-"
+
+    lines = [
+        f"Peticiones: {asked} en total ({summary['metrics']['requests_per_rep']} por repetición: ({' + '.join(str(len(u)) for _, _, u in copies.values())} unidades de la copia sembrada y la limpia) x {len(CATEGORIES)} categorías), "
+        f"{summary['metrics']['seconds_per_request_mean']} s por petición de media, prompt máximo {summary['metrics']['prompt_tokens_max']} tokens (num_ctx {config.options.get('num_ctx')}); procesador {', '.join(processors) or 'desconocido'}.",
+        f"Respuestas «sí»: {summary['metrics']['yes_total']} de {asked}; fallos de formato {summary['metrics']['format_failures']}, línea fuera del rango de la función {summary['metrics']['out_of_range']}, línea en blanco {summary['metrics']['blank_line']}, fallos de petición (tiempo o servidor) {summary['metrics']['request_failures']}.",
+        "Las citas las copia el código de la línea indicada: son literales y la línea existe por construcción, así que el criterio de citas válidas NO mide al modelo.",
+        "Defectos sembrados recuperados por semilla (repeticiones completas en que se recupera; «cualquiera» = hallazgo de cualquier categoría a ±2 líneas, lo que juzga el criterio; «su categoría» = hallazgo de la categoría de la semilla): "
+        + "; ".join(f"{k}: cualquiera {v['any']}/{reps_done}, su categoría {v['strict']}/{reps_done}" for k, v in per_seed.items()) + ".",
+        f"Hallazgos en la copia limpia por categoría (suma de las repeticiones completas): {clean_by_category}.",
+        f"Sesgo hacia «sí»: funciones con semilla {pct(rates['with_seed'])} frente al resto {pct(rates['without_seed'])}; copia sembrada {pct(rates['seeded_copy'])}, copia limpia {pct(rates['clean_copy'])}; "
+        f"celdas (función, categoría) de las semillas {pct(rates['seed_cell_seeded'])} en la sembrada frente a {pct(rates['seed_cell_clean'])} en la limpia; resto de celdas de la sembrada {pct(rates['other_cells_seeded'])}.",
+    ]
+    if incomplete:
+        lines.append(f"PROTOCOLO INCOMPLETO: {reps_done} de {reps} repeticiones completas (presupuesto de tiempo {minutes:g} min); los criterios se calculan sobre las completas.")
+    summary["notes"] = lines
+    return summary
+
+
 # -- summarizer ------------------------------------------------------------------------------------------------------
 SUMMARY_INPUTS = {
     "hydro": ("cgan_hydro_metrics.csv", "cgan_hydro_run_info.json"),
@@ -1184,9 +1355,19 @@ def retriever_rank(hits: list[dict], truth: list[tuple[str, str]], k: int = 3) -
     return min(ranks) if ranks else None
 
 
-def eval_retriever(args, rec: Recorder, work: Path, results: Path) -> dict:
-    trial = trial_for("retriever", args)
-    root = make_copy(work / "retriever_copy")
+def _rank_label(rank: int | None) -> str:
+    return f"top{rank}" if rank else "fallo"
+
+
+def eval_retriever(args, rec: Recorder, work: Path, results: Path, role: str = "retriever") -> dict:
+    """Evalúa el recuperador de embeddings (``retriever``) o su variante híbrida (``retriever_hybrid``; BM25 + embeddings por RRF).
+
+    Mismas 15 consultas, mismo criterio (acierto en el top-3 >= 80 %, entrada ``retriever`` de ``CRITERIA``). El rango que decide el
+    criterio es el del recuperador evaluado; además se miden siempre BM25 y, en la variante híbrida, los embeddings solos (los mismos
+    que daría ``retriever`` con ese modelo). Con ``--max-minutes`` se acota el tiempo total (indexado y consultas).
+    """
+    trial = trial_for(role, args)
+    root = make_copy(work / f"{role}_copy")
     dropped = 0
     for pattern in args.drop or []:  # solo diagnóstico: quita de la COPIA los ficheros que cumplan el patrón
         for path in root.glob(pattern):
@@ -1196,59 +1377,108 @@ def eval_retriever(args, rec: Recorder, work: Path, results: Path) -> dict:
     chunks = chunk_project(root)
     queries = RETRIEVER_QUERIES[: args.limit] if args.limit else RETRIEVER_QUERIES
     unanswerable = [q for q, truth in queries if not any(any(c.ruta.endswith(f) and kw.lower() in c.texto.lower() for c in chunks) for f, kw in truth)]
-    config = get_agent_config("retriever", **trial.overrides)
+    config = get_agent_config(role, **trial.overrides)
+    hybrid = config.search_backend == "hybrid"
+    backend = "hybrid" if hybrid else "embedding"
+    minutes = getattr(args, "max_minutes", None)
+    budget = minutes * 60 if minutes else None
     index_file = root / config.index_dir / "index.json"
     if index_file.exists():
         index_file.unlink()
-    t0 = time.monotonic()
+    provider = make_provider(config)
+    started = time.monotonic()
     before_index = snapshot(root)
-    first = retrieve(queries[0][0], root=root, k=3, lexical=False, build=True, **trial.overrides)  # construye y guarda el índice
-    build_s = time.monotonic() - t0
+
+    def check_budget(done: int, total: int) -> None:
+        if budget is not None and time.monotonic() - started > budget:
+            raise ProviderTimeout(f"el indexado superó el presupuesto de {minutes:g} min ({done}/{total} fragmentos)")
+
+    index = build_index(chunks, provider, model=config.model, timeout=config.timeout, progress=check_budget)  # igual que run.retrieve
+    save_index(index, resolve_index_dir(root, config.index_dir))
+    build_s = time.monotonic() - started
     ps = ollama_ps(config.base_url, config.model)
     size_kb = round(index_file.stat().st_size / 1024) if index_file.exists() else None
     n_chunks = len(chunks)
-    print(f"    índice: {n_chunks} fragmentos en {build_s:.1f}s ({size_kb} KB) {ps.get('processor', '')}", file=sys.stderr, flush=True)
+    longest = max((len(c.texto) + len(c.ruta) + 1 for c in chunks), default=0)
+    print(f"    índice ({config.model}): {n_chunks} fragmentos, {index['dim']} dimensiones, en {build_s:.1f}s ({size_kb} KB) {ps.get('processor', '')}", file=sys.stderr, flush=True)
     lexical = LexicalRetriever(chunks)
+    query_prefix = prefixes_for(config.model)[1]
     per_query = []
+    skipped = 0
     for number, (query, truth) in enumerate(queries):
+        if budget is not None and time.monotonic() - started > budget:
+            skipped = len(queries) - number
+            print(f"    presupuesto de {minutes:g} min agotado: se omiten {skipped} consultas", file=sys.stderr, flush=True)
+            break
         t1 = time.monotonic()
-        emb_hits = first if number == 0 else retrieve(query, root=root, k=3, lexical=False, **trial.overrides)
-        emb_s = time.monotonic() - t1
+        main_hits = retrieve(query, root=root, k=3, backend=backend, agent=role, **trial.overrides)  # camino real: re-trocea, lee el índice, consulta
+        main_s = time.monotonic() - t1
+        dense_hits = retrieve(query, root=root, k=3, backend="embedding", agent=role, **trial.overrides) if hybrid else main_hits
+        t2 = time.monotonic()
+        provider.embed([f"{query_prefix}{query}"], timeout=config.timeout)  # solo la llamada al modelo (latencia de la consulta)
+        embed_s = time.monotonic() - t2
         lex_hits = [h.as_dict() for h in lexical.search(query, 3)]
-        r_emb, r_lex = retriever_rank(emb_hits, truth), retriever_rank(lex_hits, truth)
+        r_main, r_dense, r_lex = retriever_rank(main_hits, truth), retriever_rank(dense_hits, truth), retriever_rank(lex_hits, truth)
         details = {
             "query": query,
             "truth": truth,
-            "embedding_rank": r_emb,
+            "main_rank": r_main,
+            "embedding_rank": r_dense,
+            "hybrid_rank": r_main if hybrid else None,
             "lexical_rank": r_lex,
-            "embedding_top": [(h["ruta"], h["linea"], round(h["puntuacion"], 3)) for h in emb_hits],
+            "embed_only_s": round(embed_s, 3),
+            "embedding_top": [(h["ruta"], h["linea"], round(h["puntuacion"], 3)) for h in dense_hits],
+            "hybrid_top": [(h["ruta"], h["linea"], round(h["puntuacion"], 5)) for h in main_hits] if hybrid else None,
             "lexical_top": [(h["ruta"], h["linea"], round(h["puntuacion"], 3)) for h in lex_hits],
         }
+        shown = f"híbrido={_rank_label(r_main)} embeddings={_rank_label(r_dense)}" if hybrid else f"embeddings={_rank_label(r_main)}"
         record = RunRecord(
-            role=trial.label, model=config.model, case=f"q{number + 1:02d}", rep=1, success=r_emb is not None, stop_reason="final", steps=1, tokens=None,
-            prompt_tokens_last=None, seconds=round(emb_s, 2), context_length=ps.get("context_length"), num_ctx_config=config.options.get("num_ctx"),
-            processor=ps.get("processor", ""), cpu_offload=ps.get("cpu_offload"), notes=f"embeddings={'top' + str(r_emb) if r_emb else 'fallo'} léxico={'top' + str(r_lex) if r_lex else 'fallo'} | {query}", details=details,
+            role=trial.label, model=config.model, case=f"q{number + 1:02d}", rep=1, success=r_main is not None, stop_reason="final", steps=1, tokens=None,
+            prompt_tokens_last=None, seconds=round(main_s, 2), context_length=ps.get("context_length"), num_ctx_config=config.options.get("num_ctx"),
+            processor=ps.get("processor", ""), cpu_offload=ps.get("cpu_offload"), notes=f"{shown} léxico={_rank_label(r_lex)} | {query}", details=details,
         )
         rec.add(record)
         per_query.append(details)
     n = len(per_query)
-    emb_hits_n = sum(d["embedding_rank"] is not None for d in per_query)
+    main_n = sum(d["main_rank"] is not None for d in per_query)
+    dense_n = sum(d["embedding_rank"] is not None for d in per_query)
     lex_hits_n = sum(d["lexical_rank"] is not None for d in per_query)
-    emb_top1 = sum(d["embedding_rank"] == 1 for d in per_query)
+    main_top1 = sum(d["main_rank"] == 1 for d in per_query)
+    dense_top1 = sum(d["embedding_rank"] == 1 for d in per_query)
     lex_top1 = sum(d["lexical_rank"] == 1 for d in per_query)
-    both = sum(d["embedding_rank"] is not None and d["lexical_rank"] is not None for d in per_query)
-    only_emb = [d["query"] for d in per_query if d["embedding_rank"] is not None and d["lexical_rank"] is None]
-    only_lex = [d["query"] for d in per_query if d["embedding_rank"] is None and d["lexical_rank"] is not None]
+    both = sum(d["main_rank"] is not None and d["lexical_rank"] is not None for d in per_query)
+    only_main = [d["query"] for d in per_query if d["main_rank"] is not None and d["lexical_rank"] is None]
+    only_lex = [d["query"] for d in per_query if d["main_rank"] is None and d["lexical_rank"] is not None]
+    numbered = {d["query"]: f"q{i + 1:02d}" for i, d in enumerate(per_query)}
     modified = snapshot(root) != before_index
+    query_s = [r.seconds for r in rec.runs]
+    embed_only = [d["embed_only_s"] for d in per_query]
+    variant = "híbrido BM25 + embeddings" if hybrid else "embeddings"
+    mean_query = round(sum(query_s) / len(query_s), 2) if query_s else 0.0
+    mean_embed = round(sum(embed_only) / len(embed_only), 3) if embed_only else 0.0
+    notes = [
+        f"Top-3 de {n} consultas: {variant} ({config.model}) {main_n}/{n}, BM25 {lex_hits_n}/{n}" + (f", solo embeddings {dense_n}/{n}" if hybrid else "") + ". Referencias medidas antes: BM25 11/15 (73 %), nomic-embed-text 9/15 (60 %).",
+        f"Frente a BM25: fallo -> acierto en {len(only_main)} consultas {[numbered[q] for q in only_main]}; acierto -> fallo en {len(only_lex)} {[numbered[q] for q in only_lex]}; aciertan los dos en {both}.",
+        f"Top-1: {variant} {main_top1}/{n}, BM25 {lex_top1}/{n}" + (f", solo embeddings {dense_top1}/{n}" if hybrid else "") + ".",
+        f"Tiempo: indexado {build_s:.1f} s ({n_chunks} fragmentos, {index['dim']} dimensiones, {size_kb} KB); por consulta {mean_query} s (llamada completa del recuperador: re-trocea, lee el índice, consulta y ordena) de los que {mean_embed} s son solo la llamada al modelo; procesador {ps.get('processor') or 'desconocido'}.",
+        f"Contexto: el fragmento más largo (ruta incluida) tiene {longest} caracteres y num_ctx es {config.options.get('num_ctx')}.",
+    ]
+    if skipped:
+        notes.append(f"PROTOCOLO INCOMPLETO: {skipped} consultas sin evaluar por el presupuesto de tiempo ({minutes:g} min).")
     return {
         "metrics": {
-            "chunks": n_chunks, "index_build_s": round(build_s, 1), "index_kb": size_kb, "queries": n, "unanswerable_queries": unanswerable,
-            "embedding_top3": emb_hits_n, "lexical_top3": lex_hits_n, "embedding_top1": emb_top1, "lexical_top1": lex_top1,
-            "dropped_files": dropped, "drop_patterns": args.drop or [], "both_top3": both, "only_embedding": only_emb, "only_lexical": only_lex, "processor": ps.get("processor"), "copy_changes_besides_index": [k for k in snapshot(root) if k not in before_index and not k.startswith(".agent_runs/")] if modified else [],
+            "chunks": n_chunks, "dim": index["dim"], "index_build_s": round(build_s, 1), "index_kb": size_kb, "queries": n, "unanswerable_queries": unanswerable,
+            "mode": backend, "main_top3": main_n, "main_top1": main_top1, "embedding_top3": dense_n if hybrid else main_n, "lexical_top3": lex_hits_n,
+            "embedding_top1": dense_top1 if hybrid else main_top1, "lexical_top1": lex_top1,
+            "dropped_files": dropped, "drop_patterns": args.drop or [], "both_top3": both, "only_embedding": only_main, "only_lexical": only_lex,
+            "gained_vs_bm25": [numbered[q] for q in only_main], "lost_vs_bm25": [numbered[q] for q in only_lex],
+            "query_s_mean": mean_query, "embed_only_s_mean": mean_embed, "longest_chunk_chars": longest, "skipped_queries": skipped,
+            "processor": ps.get("processor"), "copy_changes_besides_index": [k for k in snapshot(root) if k not in before_index and not k.startswith(".agent_runs/")] if modified else [],
         },
+        "notes": notes,
         "criteria": [
-            (f"Acierto en el top-3 con embeddings ({config.model})", ">= 80 %", f"{100 * emb_hits_n / n:.0f} % ({emb_hits_n}/{n}); top-1: {emb_top1}/{n}", emb_hits_n / n >= CRITERIA["retriever"]["top3_min"]),
-            ("Línea base léxica (BM25), misma verdad (informativo)", "-", f"{100 * lex_hits_n / n:.0f} % ({lex_hits_n}/{n}); top-1: {lex_top1}/{n}", lex_hits_n >= emb_hits_n),
+            (f"Acierto en el top-3 con {variant} ({config.model})", ">= 80 %", f"{100 * main_n / n:.0f} % ({main_n}/{n}); top-1: {main_top1}/{n}" if n else "-", n > 0 and main_n / n >= CRITERIA["retriever"]["top3_min"]),
+            ("Línea base léxica (BM25), misma verdad (informativo)", "-", f"{100 * lex_hits_n / n:.0f} % ({lex_hits_n}/{n}); top-1: {lex_top1}/{n}" if n else "-", lex_hits_n >= main_n),
         ],
     }
 
@@ -1279,9 +1509,14 @@ EVALUATORS = {
     "doc_checker": eval_doc_checker,
     "doc_checker_ss": functools.partial(eval_doc_checker, role="doc_checker_ss"),
     "doc_checker_pairs": eval_doc_checker_pairs,
+    "doc_checker_pairs_short": functools.partial(eval_doc_checker_pairs, role="doc_checker_pairs_short"),
+    "doc_checker_pairs_json": functools.partial(eval_doc_checker_pairs, role="doc_checker_pairs_json"),
+    "doc_checker_pairs_agree": functools.partial(eval_doc_checker_pairs, role="doc_checker_pairs_agree"),
     "code_reviewer": eval_code_reviewer,
+    "code_reviewer_funcs": eval_code_reviewer_funcs,
     "summarizer": eval_summarizer,
     "retriever": eval_retriever,
+    "retriever_hybrid": functools.partial(eval_retriever, role="retriever_hybrid"),
 }
 
 
@@ -1370,7 +1605,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provider", help="cambia el proveedor del rol evaluado (p. ej. ollama_systemone para un modelo de decisión como tev1)")
     parser.add_argument("--think", choices=["true", "false"], help="fija options.think del rol evaluado (razonamiento de los modelos que lo admiten)")
     parser.add_argument("--max-seconds", dest="max_seconds", type=float, help="tope de tiempo (s) de cada petición del rol evaluado")
-    parser.add_argument("--max-minutes", dest="max_minutes", type=float, help="solo doc_checker_pairs: presupuesto de tiempo de la evaluación (no se empieza una repetición que no quepa)")
+    parser.add_argument("--max-minutes", dest="max_minutes", type=float, help="solo doc_checker_pairs*, code_reviewer_funcs y retriever*: presupuesto de tiempo de la evaluación (no se empieza una repetición que no quepa)")
     parser.add_argument("--reps", type=int, help="solo para pruebas rápidas: sustituye las repeticiones del protocolo")
     parser.add_argument("--limit", type=int, help="solo para pruebas rápidas: primeros N casos")
     parser.add_argument("--drop", action="append", help="solo diagnóstico del retriever: quita de la copia los ficheros que cumplan este patrón (repetible)")

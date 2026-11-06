@@ -9,7 +9,7 @@ Uso (desde la carpeta ``src``)::
     python -m amp_agents.run --agent doc_checker_ss context/constitution/roadmap.md TODO.md --note "cifras y fechas"   # en una pasada, sin herramientas
     python -m amp_agents.run --agent code_reviewer src/amp_gan/properties.py
     python -m amp_agents.run --agent summarizer context/data/processed/cgan_hydro_metrics.csv context/data/processed/cgan_hydro_run_info.json
-    python -m amp_agents.run --agent retriever "¿cómo se elige el backend por defecto?" --k 3 [--embedding [--build-index]]
+    python -m amp_agents.run --agent retriever "¿cómo se elige el backend por defecto?" --k 3 [--embedding|--hybrid [--build-index]]
 
 El primer argumento posicional depende del rol: ``locator`` y ``retriever`` reciben la pregunta; ``doc_checker`` dos
 o más rutas de documentos; ``code_reviewer`` la ruta de un fichero de ``src/``; ``summarizer`` las rutas de los
@@ -32,8 +32,9 @@ Opciones:
                    úsese una copia para pruebas
     --log-dir      carpeta de registros JSONL (por defecto ``<root>/.agent_runs``)
     --config       otro ``agents.toml``
-    --k, --lexical, --embedding, --build-index   solo ``retriever`` (nº de resultados; BM25 léxico, que es lo que se usa por
-                   defecto según ``search_backend``; embeddings, que exigen el servidor y el índice; reconstruir el índice)
+    --k, --lexical, --embedding, --hybrid, --build-index   solo ``retriever`` (nº de resultados; BM25 léxico, que es lo que se
+                   usa por defecto según ``search_backend``; embeddings, que exigen el servidor y el índice; fusión híbrida BM25 +
+                   embeddings por rango recíproco, que también los exige; reconstruir el índice)
 
 Código de salida: 0 si el motivo de parada es ``final`` (y la verificación, si la hay, es válida); 1 si no; 2 por error de
 configuración o de uso. El informe final se escribe en la salida estándar y un resumen (pasos, tokens, tiempo, registro)
@@ -61,9 +62,11 @@ from .loop import AgentResult, run_agent, run_single_shot
 from .providers import ChatProvider, ProviderError, ProviderTimeout
 from .retrieval import (
     EmbeddingRetriever,
+    HybridRetriever,
     LexicalRetriever,
     build_index,
     chunk_project,
+    index_matches,
     load_index,
     resolve_index_dir,
     save_index,
@@ -136,25 +139,34 @@ def retrieve(
     lexical: bool | None = None,
     build: bool = False,
     embedder=None,
+    backend: str | None = None,
+    agent: str = "retriever",
     **overrides,
 ) -> list[dict]:
     """Rol ``retriever``: los ``k`` fragmentos más cercanos a ``query`` (``ruta``, ``linea``, ``puntuacion``, ``texto``).
 
     Por defecto usa el recuperador léxico BM25 (sin modelo ni índice), el que fija ``search_backend`` en la
-    configuración del rol. Los embeddings son una opción explícita: ``lexical=False`` o ``search_backend = "embedding"``;
-    entonces se usa el índice de ``index_dir``, que se construye (y guarda) si no existe o si ``build=True``.
-    ``lexical`` (si no es ``None``) manda sobre la configuración. ``embedder`` permite inyectar un proveedor simulado.
+    configuración del rol. Los embeddings son una opción explícita (``lexical=False``, ``backend="embedding"`` o
+    ``search_backend = "embedding"``) y también la fusión híbrida BM25 + embeddings (``backend="hybrid"`` o ``search_backend =
+    "hybrid"``); entonces se usa el índice de ``index_dir``, que se construye (y guarda) si no existe, si ``build=True`` o si se
+    construyó con otro modelo (un índice no se reutiliza entre modelos). ``backend`` (si no es ``None``) manda sobre ``lexical``,
+    y ``lexical`` (si no es ``None``) sobre la configuración. ``embedder`` permite inyectar un proveedor simulado. ``agent`` es
+    el rol de embeddings cuya configuración se usa (``retriever`` o una variante como ``retriever_hybrid``).
     """
-    config = get_agent_config("retriever", config_path, **overrides)
+    config = get_agent_config(agent, config_path, **overrides)
     base = Path(root).resolve() if root else PROJECT_ROOT
-    if lexical is None:
-        lexical = config.search_backend == "lexical"
+    if backend is None:
+        backend = config.search_backend if lexical is None else ("lexical" if lexical else "embedding")
+    if backend not in {"lexical", "embedding", "hybrid"}:
+        raise ConfigError(f"backend de búsqueda desconocido: {backend!r}")
     chunks = chunk_project(base)
-    if lexical:
+    if backend == "lexical":
         return search(LexicalRetriever(chunks), query, k)
     provider = embedder or make_provider(config)
     folder = resolve_index_dir(base, config.index_dir)
     index = None if build else load_index(folder)
+    if index is not None and not index_matches(index, config.model):
+        index = None  # índice de otro modelo: se reconstruye (y se sobrescribe) en lugar de mezclar espacios de embeddings
     if index is None:
         started = time.monotonic()
 
@@ -164,7 +176,8 @@ def retrieve(
 
         index = build_index(chunks, provider, model=config.model, timeout=config.timeout, progress=check_time)
         save_index(index, folder)
-    return search(EmbeddingRetriever(index, provider, timeout=config.timeout), query, k)
+    dense = EmbeddingRetriever(index, provider, timeout=config.timeout)
+    return search(dense if backend == "embedding" else HybridRetriever(LexicalRetriever(chunks), dense), query, k)
 
 
 def number_lines(text: str) -> str:
@@ -249,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--lexical", action="store_true", help="solo retriever: BM25 sin modelo (es lo que usa por defecto)")
     parser.add_argument("--embedding", action="store_true", help="solo retriever: embeddings (necesita el índice y el servidor de modelos)")
+    parser.add_argument("--hybrid", action="store_true", help="solo retriever: BM25 + embeddings por rango recíproco (necesita el índice y el servidor de modelos)")
     parser.add_argument("--build-index", dest="build_index", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -257,15 +271,13 @@ def main(argv: list[str] | None = None) -> int:
         if config.mode == "embedding":
             if not args.inputs:
                 raise ConfigError("el recuperador necesita una consulta")
-            if args.lexical and args.embedding:
-                raise ConfigError("--lexical y --embedding son incompatibles")
-            use_lexical = True if args.lexical else False if args.embedding else None
-            if use_lexical is None:
-                use_lexical = config.search_backend == "lexical"
-            hits = retrieve(" ".join(args.inputs), root=base, config_path=args.config, k=args.k, lexical=use_lexical, build=args.build_index, model=args.model, base_url=args.base_url)
+            if sum([args.lexical, args.embedding, args.hybrid]) > 1:
+                raise ConfigError("--lexical, --embedding y --hybrid son incompatibles entre sí")
+            backend = "lexical" if args.lexical else "embedding" if args.embedding else "hybrid" if args.hybrid else config.search_backend
+            hits = retrieve(" ".join(args.inputs), root=base, config_path=args.config, k=args.k, backend=backend, build=args.build_index, agent=args.agent, model=args.model, base_url=args.base_url)
             print(json.dumps(hits, ensure_ascii=False, indent=1))
             check = verify(config.verifier, json.dumps(hits)) if config.verifier else Verification(True)
-            print(f"[retriever/{'lexical' if use_lexical else 'embedding'}] resultados={len(hits)} verificación={'ok' if check.valid else check.errors}", file=sys.stderr)
+            print(f"[retriever/{backend}] resultados={len(hits)} verificación={'ok' if check.valid else check.errors}", file=sys.stderr)
             return 0 if check.valid else 1
         context: dict = {}
         if args.task_file:

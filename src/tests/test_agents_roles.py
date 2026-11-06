@@ -24,6 +24,9 @@ EXPECTED = {
     "doc_checker": ("agent", "phi4-mini"),
     "doc_checker_ss": ("single_shot", "phi4-mini"),
     "doc_checker_pairs": ("single_shot", "gemma3:4b"),
+    "doc_checker_pairs_short": ("single_shot", "tev1:4b-q4_K_M"),
+    "doc_checker_pairs_json": ("single_shot", "gemma3:4b"),
+    "doc_checker_pairs_agree": ("single_shot", "gemma3:4b"),
     "code_reviewer": ("agent", "qwen2.5-coder:7b"),
     "summarizer": ("single_shot", "gemma3:4b"),
     "retriever": ("embedding", "nomic-embed-text"),
@@ -55,7 +58,7 @@ class RecordingProvider(ScriptedProvider):
 def test_every_role_has_mode_model_and_timeouts(name):
     mode, model = EXPECTED[name]
     cfg = get_agent_config(name)
-    assert cfg.mode == mode and cfg.model == model and cfg.provider == "ollama"
+    assert cfg.mode == mode and cfg.model == model and cfg.provider == ("ollama_systemone" if name == "doc_checker_pairs_short" else "ollama")
     assert cfg.max_seconds > 0 and cfg.timeout > 0
     if mode != "embedding":
         assert cfg.max_tokens and cfg.max_tokens > 0
@@ -348,7 +351,7 @@ def test_new_modules_do_not_import_heavy_frameworks_or_amp_gan():
 
     code = (
         "import sys\n"
-        "import amp_agents.retrieval, amp_agents.verifiers, amp_agents.eval_roles, amp_agents.run, amp_agents.agents\n"
+        "import amp_agents.retrieval, amp_agents.verifiers, amp_agents.eval_roles, amp_agents.run, amp_agents.agents, amp_agents.func_review\n"
         "bad = [m for m in ('keras', 'torch', 'tensorflow', 'amp_gan', 'numpy', 'pandas') if m in sys.modules]\n"
         "print('BAD', bad)\n"
         "sys.exit(1 if bad else 0)\n"
@@ -359,8 +362,8 @@ def test_new_modules_do_not_import_heavy_frameworks_or_amp_gan():
 
 def test_new_sources_have_no_forbidden_mentions():
     forbidden = ["cla" + "ude", "anthro" + "pic", "asistente de " + "ia", "/ho" + "me/"]  # troceadas: el test global revisa este fichero
-    files = [SRC / "amp_agents" / n for n in ("retrieval.py", "verifiers.py", "eval_roles.py", "agents.toml")]
-    files += [SRC / "tests" / n for n in ("fake_embedder.py", "test_agents_retrieval.py", "test_agents_verifiers.py", "test_agents_eval_roles.py")]
+    files = [SRC / "amp_agents" / n for n in ("retrieval.py", "verifiers.py", "eval_roles.py", "agents.toml", "func_review.py")]
+    files += [SRC / "tests" / n for n in ("fake_embedder.py", "test_agents_retrieval.py", "test_agents_verifiers.py", "test_agents_eval_roles.py", "test_agents_func_review.py")]
     for file in files:
         text = file.read_text(encoding="utf-8").lower().replace(".claude", "")
         for word in forbidden:
@@ -386,6 +389,20 @@ def test_cli_retriever_defaults_to_bm25_and_embeddings_need_the_flag(tmp_path, m
     monkeypatch.setattr(R, "make_provider", lambda config: FakeEmbedder())
     assert R.main(["--agent", "retriever", "backend AMP_GAN_BACKEND elige", "--embedding", "--root", str(project)]) == 0
     assert "[retriever/embedding]" in capsys.readouterr().err and (project / ".agent_runs" / "index" / "index.json").is_file()
+
+
+def test_cli_retriever_hybrid_flag_and_role(tmp_path, monkeypatch, capsys):
+    from fake_embedder import FakeEmbedder
+
+    project = project_with_roles(tmp_path)
+    monkeypatch.setattr(R, "make_provider", lambda config: FakeEmbedder())
+    assert R.main(["--agent", "retriever", "backend AMP_GAN_BACKEND elige", "--hybrid", "--root", str(project)]) == 0
+    out = capsys.readouterr()
+    assert "[retriever/hybrid]" in out.err and json.loads(out.out)[0]["puntuacion"] < 0.04  # puntuación fusionada (RRF)
+    assert R.main(["--agent", "retriever_hybrid", "backend AMP_GAN_BACKEND elige", "--root", str(project)]) == 0  # el rol híbrido lo es por configuración
+    assert "[retriever/hybrid]" in capsys.readouterr().err
+    assert R.main(["--agent", "retriever", "backend", "--hybrid", "--embedding", "--root", str(project)]) == 2
+    assert "incompatibles" in capsys.readouterr().err
 
 
 # -- aviso de datos: «Fallos» solo donde existe ----------------------------------------------------------------------------------
