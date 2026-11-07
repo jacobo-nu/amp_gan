@@ -10,7 +10,7 @@ Proyecto académico de asignatura de Biofísica del grado de Física de la USC. 
 | Directorio | Contenido |
 |---|---|
 | `context/constitution/` | Misión, roadmap, gobernanza y stack técnico |
-| `context/agents/` | Definición de cada agente |
+| `context/agents/` | Definición de cada agente y resumen de resultados con modelos locales (`resultados_modelos_locales.md`) |
 | `context/data/` | Datos locales (`raw/`, `processed/`), no versionados |
 | `context/references/` | Artículos y material de referencia (PDF) para los agentes |
 | `src/amp_gan/` | Código reutilizable (datos, modelos, entrenamiento, evaluación) |
