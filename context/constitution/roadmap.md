@@ -11,7 +11,7 @@ Estado: `[ ]` pendiente · `[~]` en curso · `[x]` hecho
 - [x] Fuente de datos: DRAMP (`general_amps.fasta`, `Antibacterial_amps.fasta`), citada en `context/data/README.md`
 - [x] Datos copiados a `context/data/raw/`, excluidos de git
 - [x] Versión confirmada: DRAMP 5.0, descargada el 28-oct-2026
-- [ ] Script de descarga reproducible
+- [x] Script de descarga reproducible (`src/amp_gan/download_data.py`, rama `feat/descarga-datos`, 18 tests sin red): URL oficiales de DRAMP, huella SHA-256 fijada, descarga atómica e idempotente, `--force`/`--accept-changes`/`--clean`; comprobado en vivo (2026-11-09): los dos ficheros descargados son idénticos a los usados en el trabajo
 - [x] Limpieza: duplicados, secuencias con aminoácidos no estándar, filtrado por longitud (`src/amp_gan/data.py`, 23 tests; rango definitivo 5–60 aa, a aplicar en las dos bases)
 - [x] Estadísticas de longitud de ambas bases (`src/amp_gan/length_stats.py`; salidas en `context/data/processed/`); corte fijado por el usuario: 5–60 aa
 - [x] Datos limpios (5–60 aa) en `context/data/processed/`: 21 754 antibacteriano, 9 391 general (`src/amp_gan/make_clean_data.py`)

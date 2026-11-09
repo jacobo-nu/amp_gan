@@ -30,5 +30,6 @@ completas en [context/data/README.md](context/data/README.md). Si usas este repo
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+python src/amp_gan/download_data.py --clean   # descarga DRAMP 5.0 (con comprobación SHA-256) y genera las bases limpias
 jupyter lab src/notebooks
 ```

@@ -19,6 +19,25 @@ repositorio solo los cita; quien lo clone debe descargarlos de DRAMP.
 > **Versión:** DRAMP 5.0, descargada el 28-oct-2026 desde <https://dramp.cpu-bioinfor.org/>
 > (la web indicaba última actualización el 20-oct-2026, 32 436 entradas).
 
+## Descarga reproducible
+
+`python src/amp_gan/download_data.py` descarga los dos FASTA desde la página oficial de descargas de DRAMP
+(<https://dramp.cpu-bioinfor.org/downloads/>, directorio `download_data/DRAMP3.0_new/` del servidor) a
+`context/data/raw/` y comprueba su huella SHA-256 contra la de la versión con la que se trabajó:
+
+| Archivo | Bytes | SHA-256 |
+|---|---|---|
+| `Antibacterial_amps.fasta` | 1 072 625 | `a0d484eb6176e123298d19d06f23ccc6398a1f5c75d169cccbbf7590a6e6c835` |
+| `general_amps.fasta` | 477 245 | `8326ff308eb3ae67cafbdbf3756c0e943d7d968e5e0a338298ce602269d1caf0` |
+
+- Si el fichero ya está y la huella coincide, no descarga nada; `--force` lo vuelve a descargar.
+- Si la huella descargada **no** coincide, no instala nada y termina con código 1: DRAMP puede haber actualizado la
+  base y los resultados dejarían de ser comparables. `--accept-changes` lo instala igualmente e imprime la huella
+  nueva (hay que actualizar `DATASETS` y esta tabla).
+- `--clean` ejecuta después `make_clean_data.py` y deja las bases limpias en `processed/`.
+- Comprobado el 2026-11-09: la descarga en vivo es idéntica byte a byte a los ficheros usados en el trabajo. La web
+  no indica versión ni fecha de publicación de estos ficheros: la huella es lo que identifica los datos.
+
 ## Licencia y condiciones de uso
 
 Según la web de DRAMP (consultada el 30-oct-2026), los datos se publican bajo **CC BY 4.0**, y piden citar sus
