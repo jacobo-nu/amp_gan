@@ -33,3 +33,9 @@ pip install -r requirements.txt
 python src/amp_gan/download_data.py --clean   # descarga DRAMP 5.0 (con comprobación SHA-256) y genera las bases limpias
 jupyter lab src/notebooks
 ```
+
+## Licencia
+
+El código y la documentación de este repositorio se distribuyen bajo la
+[licencia GNU GPL v3](LICENSE) (GPL-3.0). Los datos de DRAMP no se incluyen en el repositorio y
+tienen su propia licencia (CC BY 4.0; véase [context/data/README.md](context/data/README.md)).
